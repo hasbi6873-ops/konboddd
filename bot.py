@@ -49,10 +49,11 @@ SLIPPAGE_GUARD = 0.0015
 TTL_5M         = 2
 
 # ── Risk Management v20.4 (trailing stop) ─────────────────────────────────
-SL_PCT             = 0.015   # Longgarkan SL jadi 1.5% (Tahan noise market) ....(awalnya 0.003)
-TRAIL_ACTIVATE_PCT = 0.010   # Aktifkan trailing saat profit sudah 1% .... (awalnya 0.003)
-TRAIL_GAP_PCT      = 0.004   # Gap trailing 0.4% agar tidak gampang kesentuh jarum ....(awalnya 0.0015)
-EMERGENCY_TP_PCT   = 0.040   # TP Darurat di 4%   .... (awalnya 0.020)
+SL_PCT             = 0.015   
+TRAIL_ACTIVATE_PCT = 0.015   # 🔥 Naikkan jadi 1.5% (Tunggu profit lebih besar sebelum mengunci)
+TRAIL_GAP_PCT      = 0.005   # 🔥 Gap 0.5% (Minimal untung terkunci di 1% atau ~$0.40)
+EMERGENCY_TP_PCT   = 0.040   
+MAX_HOLD_SECONDS   = 10800   # 🔥 FITUR BARU: Maksimal tahan posisi 3 Jam (10800 detik)
 # ──────────────────────────────────────────────────────────────────────────
 
 # Kill Switch
@@ -615,6 +616,12 @@ def monitor_positions():
         if px == 0: continue
 
         side, entry, sl_px, emg_tp = pos["side"], pos["entry"], pos["sl_price"], pos["emergency_tp"]
+
+        # 🔥 TAMBAHKAN BLOK INI: Time-Stop untuk posisi nyangkut
+        hold_time = time.time() - pos["open_time"]
+        if hold_time > MAX_HOLD_SECONDS:
+            live_close(sym, "TIME_LIMIT", px)
+            continue
 
         if side == "LONG":
             if px > pos["peak_price"]: pos["peak_price"] = px
