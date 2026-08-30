@@ -1,10 +1,11 @@
 """
-Bot Scalping v20.8 LIVE — REAL ORDERS (Binance Testnet)
+Bot Scalping v20.8 LIVE — REAL ORDERS (Binance Real / Testnet)
 ====================================================
-PERBAIKAN FINAL (Absolute PnL Sync):
-- Memecahkan "Slippage Denial": Bot kini menghitung harga eksekusi final secara matematis dari (cumQuote / executedQty). PnL di Log dijamin 100% SAMA dengan Saldo Exchange.
-- Mencegah Phantom Profits: Jika CLOSE ORDER gagal di exchange, bot akan mencoba close ulang (auto-retry).
-- COOLDOWN 5 MENIT (300 detik) aktif untuk mencegah Spamming re-entry.
+PERBAIKAN FINAL + KEAMANAN AKUN REAL:
+1. Absolute PnL Sync: PnL di log 100% sama dengan exchange.
+2. Websocket Ticker: Mencegah Rate Limit Ban (Blokir API).
+3. State Recovery: Mencegah posisi ngambang tak terurus saat bot restart.
+4. Spread Filter: Mencegah kerugian instan dari Slippage market sepi.
 """
 
 import os
@@ -20,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 
 from dotenv import load_dotenv
-from binance.client import Client
+from binance import Client, ThreadedWebsocketManager
 import ta
 
 load_dotenv()
@@ -45,15 +46,15 @@ COOLDOWN_SEC  = 300   # 5 Menit jeda agar tidak spam order
 
 # Scoring & Filter
 MIN_SCORE      = 55
-SLIPPAGE_GUARD = 0.0015
+MAX_SPREAD_PCT = 0.15  # 🔥 Maksimal spread 0.15% (Cegah Slippage)
 TTL_5M         = 2
 
 # ── Risk Management v20.4 (trailing stop) ─────────────────────────────────
 SL_PCT             = 0.015   
-TRAIL_ACTIVATE_PCT = 0.015   # 🔥 Naikkan jadi 1.5% (Tunggu profit lebih besar sebelum mengunci)
-TRAIL_GAP_PCT      = 0.005   # 🔥 Gap 0.5% (Minimal untung terkunci di 1% atau ~$0.40)
+TRAIL_ACTIVATE_PCT = 0.015   # Naikkan jadi 1.5% (Tunggu profit lebih besar)
+TRAIL_GAP_PCT      = 0.005   # Gap 0.5% (Minimal untung terkunci di 1%)
 EMERGENCY_TP_PCT   = 0.040   
-MAX_HOLD_SECONDS   = 10800   # 🔥 FITUR BARU: Maksimal tahan posisi 3 Jam (10800 detik)
+MAX_HOLD_SECONDS   = 10800   # Maksimal tahan posisi 3 Jam (10800 detik)
 # ──────────────────────────────────────────────────────────────────────────
 
 # Kill Switch
@@ -116,83 +117,6 @@ class MarketRegime:
         elif atr_expand and adx < 20: return MarketRegime.REGIME_VOLATILE, 50, 0
         elif (atr_collapse and decelerating) or (adx > 20 and adx < 35 and decelerating): return MarketRegime.REGIME_EXHAUSTION, 40, (1 if m5 > 0 else -1)
         else: return MarketRegime.REGIME_RANGE, 30, 0
-
-class ExhaustionConfirmation:
-    @staticmethod
-    def check_short_exhaustion(df: pd.DataFrame) -> Tuple[bool, int, List[str]]:
-        if df is None or len(df) < 55: return False, 0, []
-        row, prev = df.iloc[-2], df.iloc[-3]
-        conditions, reasons = [], []
-        conditions.append(row["rsi"] > 75)
-        if row["rsi"] > 75: reasons.append(f"RSI_{row['rsi']:.0f}>75")
-        high_price, high_rsi = max(df["high"].iloc[-10:]), max(df["rsi"].iloc[-10:])
-        ok = row["close"] >= high_price * 0.99 and row["rsi"] < high_rsi - 3
-        conditions.append(ok)
-        if ok: reasons.append("RSI_Div")
-        high_macd = max(df["mh"].iloc[-10:])
-        ok = row["close"] >= high_price * 0.99 and row["mh"] < high_macd - 0.5 * row["atr"]
-        conditions.append(ok)
-        if ok: reasons.append("MACD_Div")
-        conditions.append(row["vr"] > 2.0)
-        if row["vr"] > 2.0: reasons.append(f"VolClimax_{row['vr']:.1f}x")
-        vol_prev = prev["vr"] if not np.isnan(prev["vr"]) else 1
-        ok = row["vr"] > 1.8 and row["vr"] > vol_prev * 1.2
-        conditions.append(ok)
-        if ok: reasons.append("DeltaVolClimax")
-        body, upper_wick = abs(row["close"] - row["open"]), row["high"] - max(row["close"], row["open"])
-        ok = upper_wick > body * 1.5 and upper_wick > row["atr"] * 0.3
-        conditions.append(ok)
-        if ok: reasons.append("LongUpperWick")
-        atr_s, atr_peak = df["atr"].iloc[-10:], df["atr"].iloc[-10:].max()
-        ok = atr_peak > atr_s.iloc[-5] * 1.3 and row["atr"] < atr_peak * 0.8
-        conditions.append(ok)
-        if ok: reasons.append("ATR_ExpCollapse")
-        ok = row["m5"] > 0.002 and row["m5"] < prev["m5"] * 0.7
-        conditions.append(ok)
-        if ok: reasons.append("MomDecel")
-        br_peak = max(df["br"].iloc[-10:])
-        ok = row["br"] < br_peak - 0.1 and br_peak > 0.6
-        conditions.append(ok)
-        if ok: reasons.append("OrderflowRev")
-        return sum(conditions) >= 3, sum(conditions), reasons
-
-    @staticmethod
-    def check_long_exhaustion(df: pd.DataFrame) -> Tuple[bool, int, List[str]]:
-        if df is None or len(df) < 55: return False, 0, []
-        row, prev = df.iloc[-2], df.iloc[-3]
-        conditions, reasons = [], []
-        conditions.append(row["rsi"] < 25)
-        if row["rsi"] < 25: reasons.append(f"RSI_{row['rsi']:.0f}<25")
-        low_price, low_rsi = min(df["low"].iloc[-10:]), min(df["rsi"].iloc[-10:])
-        ok = row["close"] <= low_price * 1.01 and row["rsi"] > low_rsi + 3
-        conditions.append(ok)
-        if ok: reasons.append("RSI_Div_Bull")
-        low_macd = min(df["mh"].iloc[-10:])
-        ok = row["close"] <= low_price * 1.01 and row["mh"] > low_macd + 0.5 * row["atr"]
-        conditions.append(ok)
-        if ok: reasons.append("MACD_Div_Bull")
-        conditions.append(row["vr"] > 2.0)
-        if row["vr"] > 2.0: reasons.append(f"VolClimax_{row['vr']:.1f}x")
-        vol_prev = prev["vr"] if not np.isnan(prev["vr"]) else 1
-        ok = row["vr"] > 1.8 and row["vr"] > vol_prev * 1.2
-        conditions.append(ok)
-        if ok: reasons.append("DeltaVolClimax")
-        body, lower_wick = abs(row["close"] - row["open"]), min(row["close"], row["open"]) - row["low"]
-        ok = lower_wick > body * 1.5 and lower_wick > row["atr"] * 0.3
-        conditions.append(ok)
-        if ok: reasons.append("LongLowerWick")
-        atr_s, atr_peak = df["atr"].iloc[-10:], df["atr"].iloc[-10:].max()
-        ok = atr_peak > atr_s.iloc[-5] * 1.3 and row["atr"] < atr_peak * 0.8
-        conditions.append(ok)
-        if ok: reasons.append("ATR_ExpCollapse")
-        ok = row["m5"] < -0.002 and row["m5"] > prev["m5"] * 0.7
-        conditions.append(ok)
-        if ok: reasons.append("MomDecel_Bull")
-        br_trough = min(df["br"].iloc[-10:])
-        ok = row["br"] > br_trough + 0.1 and br_trough < 0.4
-        conditions.append(ok)
-        if ok: reasons.append("OrderflowRev_Bull")
-        return sum(conditions) >= 3, sum(conditions), reasons
 
 class SignalWeights:
     def __init__(self):
@@ -348,6 +272,8 @@ _executor        = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q        = queue.Queue()
 _hot_syms        = deque(maxlen=30)
 
+live_prices = {} # 🔥 Penyimpanan Harga Real-Time Websocket
+
 _macro = {"btc": "UNKNOWN"}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
@@ -380,6 +306,8 @@ def qty(symbol, price):
     return round(raw, get_precision(symbol))
 
 def price_live(symbol):
+    # 🔥 FITUR BARU: Ambil data harga dari Websocket memori (Cegah API Ban)
+    if symbol in live_prices: return live_prices[symbol]
     try: return float(client.futures_symbol_ticker(symbol=symbol)["price"])
     except: return 0.0
 
@@ -439,36 +367,24 @@ def ks_upd(pnl):
     _ks["daily"] += pnl
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
-# 🔥 FITUR BARU: Absolute Fill Price Fetcher
 def get_real_fill_price(sym, order_resp):
-    """Memastikan bot mendapatkan harga mutlak dari Binance, menolak data 0"""
     try:
-        # 1. Kalkulasi Matematika Mutlak: Total USDT / Jumlah Koin
         cum_quote = float(order_resp.get('cumQuote', 0))
         exec_qty = float(order_resp.get('executedQty', 0))
-        if exec_qty > 0 and cum_quote > 0:
-            return cum_quote / exec_qty
-        
-        # 2. Cek harga bawaan JSON
+        if exec_qty > 0 and cum_quote > 0: return cum_quote / exec_qty
         avg_px = float(order_resp.get('avgPrice', 0))
-        if avg_px > 0:
-            return avg_px
-
-        # 3. Fallback jika Binance delay: Ping server langsung
+        if avg_px > 0: return avg_px
         order_id = order_resp.get('orderId')
         if order_id:
-            for _ in range(2): # Coba 2x
+            for _ in range(2):
                 time.sleep(0.5)
                 info = client.futures_get_order(symbol=sym, orderId=order_id)
                 c_quote = float(info.get('cumQuote', 0))
                 e_qty = float(info.get('executedQty', 0))
-                if e_qty > 0 and c_quote > 0:
-                    return c_quote / e_qty
+                if e_qty > 0 and c_quote > 0: return c_quote / e_qty
                 a_px = float(info.get('avgPrice', 0))
-                if a_px > 0:
-                    return a_px
-    except Exception:
-        pass
+                if a_px > 0: return a_px
+    except Exception: pass
     return 0.0
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -479,6 +395,19 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS: return
         live_positions[sym] = {"_r": True}
+
+    # 🔥 FITUR BARU: SPREAD FILTER 
+    try:
+        ob = client.futures_order_book(symbol=sym, limit=5)
+        best_bid = float(ob['bids'][0][0])
+        best_ask = float(ob['asks'][0][0])
+        spread_pct = (best_ask - best_bid) / best_bid * 100
+        if spread_pct > MAX_SPREAD_PCT:
+            print(f"  ⚠️ BATAL ENTRY {sym}: Jarak harga jual/beli ({spread_pct:.2f}%) terlalu lebar!")
+            with _lock: live_positions.pop(sym, None)
+            return
+    except Exception:
+        pass # Lanjutkan jika API orderbook delay
 
     px_now = price_live(sym)
     if px_now > 0:
@@ -508,7 +437,6 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
             symbol=sym, side='BUY' if orig_direction == 'LONG' else 'SELL',
             type='MARKET', quantity=q_val, newOrderRespType='RESULT'
         )
-        # 🔥 PENGGUNAAN FITUR BARU: Ambil harga pasti dari server
         real_px = get_real_fill_price(sym, order)
         if real_px > 0:
             price = real_px
@@ -540,13 +468,11 @@ def live_close(sym, reason, price=None):
 
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
 
-    # ── REAL CLOSE ORDER — market order reduceOnly ke Binance testnet ────
     try:
         close_order = client.futures_create_order(
             symbol=sym, side='SELL' if side == 'LONG' else 'BUY',
             type='MARKET', quantity=q_val, reduceOnly=True, newOrderRespType='RESULT'
         )
-        # 🔥 PENGGUNAAN FITUR BARU: Ambil harga pasti dari server
         real_px = get_real_fill_price(sym, close_order)
         if real_px > 0:
             price = real_px
@@ -555,7 +481,6 @@ def live_close(sym, reason, price=None):
         print(f"  ⚠️ CLOSE ORDER GAGAL {sym}: {e}")
         with _lock: live_positions[sym] = pos
         return 
-    # ─────────────────────────────────────────────────────────────────────
 
     gross_pnl  = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
     fee_rate   = 0.0005
@@ -617,7 +542,6 @@ def monitor_positions():
 
         side, entry, sl_px, emg_tp = pos["side"], pos["entry"], pos["sl_price"], pos["emergency_tp"]
 
-        # 🔥 TAMBAHKAN BLOK INI: Time-Stop untuk posisi nyangkut
         hold_time = time.time() - pos["open_time"]
         if hold_time > MAX_HOLD_SECONDS:
             live_close(sym, "TIME_LIMIT", px)
@@ -812,15 +736,59 @@ def t_macro():
         except: pass
         time.sleep(10)
 
+# 🔥 FITUR BARU: Websocket Message Handler
+def handle_ws_messages(msg):
+    if isinstance(msg, dict) and 'data' in msg:
+        data = msg['data']
+        if 's' in data and 'c' in data:
+            live_prices[data['s']] = float(data['c'])
+    elif isinstance(msg, dict) and 's' in msg and 'c' in msg:
+        live_prices[msg['s']] = float(msg['c'])
+
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  🔴 TRAIL v20.8 LIVE — ABSOLUTE PNL SYNC (Anti-Phantom)            ║")
-    print("║  ✅ Memastikan PnL Terminal = PnL Saldo Exchange 100% SAMA         ║")
-    print("║  ✅ Auto-retry close order & 5 Menit Jeda Anti-Spam                ║")
+    print("║  🔴 TRAIL v20.8 LIVE — ACCOUNT PROTECTION BUNDLE                   ║")
+    print("║  ✅ Websocket Active (Anti Rate-Limit Ban)                         ║")
+    print("║  ✅ State Recovery Active (Aman di-restart Railway)                ║")
+    print("║  ✅ Spread Filter Active (Anti Slippage)                           ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
+    
     try: valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
     except: valid = set(SYMBOLS)
     syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
+
+    # 🔥 START WEBSOCKET (DIUPDATE AGAR KOMPATIBEL)
+    twm = ThreadedWebsocketManager(api_key=os.getenv("API_KEY"), api_secret=os.getenv("API_SECRET"))
+    twm.start()
+    
+    # Gunakan multiplex socket untuk mendengarkan ticker futures secara stabil
+    streams = [f"{s.lower()}@ticker" for s in syms[:15]] # Ambil 15 simbol utama teratas agar tidak overload
+    twm.start_multiplex_socket(callback=handle_ws_messages, streams=streams)
+    
+    # 🔥 STATE RECOVERY SAAT BOT MENYALA
+    print("  🔄 Sinkronisasi Posisi Aktif dari Binance...")
+    try:
+        open_pos = client.futures_position_information()
+        for pos in open_pos:
+            amt = float(pos['positionAmt'])
+            if amt != 0:
+                sym = pos['symbol']
+                ep = float(pos['entryPrice'])
+                sd = "LONG" if amt > 0 else "SHORT"
+                sl_p, emg = RiskManager.calculate_levels(ep, sd)
+                
+                with _lock:
+                    live_positions[sym] = {
+                        "side": sd, "entry": ep, "qty": abs(amt),
+                        "open_time": time.time(), "score": 100, "sigs": ["RECOVERED_BY_BOT"],
+                        "atr": 0, "regime": "UNKNOWN", "bias": 0,
+                        "sl_price": sl_p, "emergency_tp": emg,
+                        "peak_price": ep, "trail_active": False, "trail_stop": None,
+                        "_r": False
+                    }
+                print(f"  ✅ Recovery Berhasil: {sym} {sd} Qty:{abs(amt)} Entry:{ep}")
+    except Exception as e:
+        print(f"  ❌ Gagal recovery posisi: {e}")
     
     threading.Thread(target=t_monitor, daemon=True).start()
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
