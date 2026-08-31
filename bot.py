@@ -26,7 +26,7 @@ import ta
 
 load_dotenv()
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
-# client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
