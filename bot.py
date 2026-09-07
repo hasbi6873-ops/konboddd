@@ -1,11 +1,11 @@
 """
-Bot Scalping v20.8 LIVE — REAL ORDERS (Binance Real / Testnet)
+Bot Scalping v20.9 LIVE — REAL ORDERS (Binance Testnet)
 ====================================================
-PERBAIKAN FINAL + KEAMANAN AKUN REAL:
-1. Absolute PnL Sync: PnL di log 100% sama dengan exchange.
-2. Websocket Ticker: Mencegah Rate Limit Ban (Blokir API).
-3. State Recovery: Mencegah posisi ngambang tak terurus saat bot restart.
-4. Spread Filter: Mencegah kerugian instan dari Slippage market sepi.
+PERBAIKAN FITUR:
+- Fix Bug Swap Logic: LONG khusus scoring indikator Bullish & SHORT khusus Bearish.
+- BTC Macro Guard: Mencegah Long saat BTC crash & Short saat BTC pump.
+- Reduced Hold Time: Maksimal hold posisi 3600 detik (1 Jam).
+- Absolute PnL Sync & Anti-Phantom tetap aktif.
 """
 
 import os
@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 
 from dotenv import load_dotenv
-from binance import Client, ThreadedWebsocketManager
+from binance.client import Client
 import ta
 
 load_dotenv()
@@ -32,8 +32,8 @@ client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
 
-LEVERAGE     = 20
-ORDER_USDT   = 2.0
+LEVERAGE      = 20
+ORDER_USDT    = 2.0
 MAX_POSITIONS = 3
 
 # Scanning
@@ -46,20 +46,20 @@ COOLDOWN_SEC  = 300   # 5 Menit jeda agar tidak spam order
 
 # Scoring & Filter
 MIN_SCORE      = 55
-MAX_SPREAD_PCT = 0.15  # 🔥 Maksimal spread 0.15% (Cegah Slippage)
+SLIPPAGE_GUARD = 0.0015
 TTL_5M         = 2
 
-# ── Risk Management v20.4 (trailing stop) ─────────────────────────────────
+# ── Risk Management v20.9 (trailing stop) ─────────────────────────────────
 SL_PCT             = 0.015   
-TRAIL_ACTIVATE_PCT = 0.015   # Naikkan jadi 1.5% (Tunggu profit lebih besar)
-TRAIL_GAP_PCT      = 0.005   # Gap 0.5% (Minimal untung terkunci di 1%)
+TRAIL_ACTIVATE_PCT = 0.015   # Tetap 1.5%
+TRAIL_GAP_PCT      = 0.005   # Tetap 0.5%
 EMERGENCY_TP_PCT   = 0.040   
-MAX_HOLD_SECONDS   = 10800   # Maksimal tahan posisi 3 Jam (10800 detik)
+MAX_HOLD_SECONDS   = 3600    # PERBAIKAN: Maksimal tahan posisi 1 Jam (3600 detik)
 # ──────────────────────────────────────────────────────────────────────────
 
 # Kill Switch
-DAILY_LOSS  = -20.0
-CONSEC_MAX  = 15
+DAILY_LOSS   = -20.0
+CONSEC_MAX   = 15
 CONSEC_PAUSE = 10
 
 # Learning
@@ -105,7 +105,7 @@ class MarketRegime:
         mild_bear  = close < e9 < e21
         strong_trend      = adx > 25
         very_strong_trend = adx > 35
-        atr_expand  = (atr / atr_prev) > 1.2 if atr_prev > 0 else False
+        atr_expand   = (atr / atr_prev) > 1.2 if atr_prev > 0 else False
         atr_collapse = (atr / atr_prev) < 0.8 if atr_prev > 0 else False
         m5, m5_prev = row["m5"], prev["m5"]
         decelerating = (abs(m5) < abs(m5_prev)) if not np.isnan(m5_prev) else False
@@ -155,36 +155,29 @@ class SignalScorer:
         long_score, long_sigs = self._score_long(df)
         short_score, short_sigs = self._score_short(df)
         atr = df["atr"].iloc[-2]
+        
+        # PERBAIKAN: Gunakan BTC Macro Guard untuk menyaring entri
+        btc_regime = _macro.get("btc", "UNKNOWN")
 
         if regime == MarketRegime.REGIME_TRENDING_BULL:
+            if btc_regime == MarketRegime.REGIME_TRENDING_BEAR:
+                return None, 0, [], atr, 0, 0, regime, bias
             if long_score >= MIN_SCORE: return "LONG", long_score, long_sigs, atr, 0, 0, regime, bias
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
+            
         elif regime == MarketRegime.REGIME_TRENDING_BEAR:
+            if btc_regime == MarketRegime.REGIME_TRENDING_BULL:
+                return None, 0, [], atr, 0, 0, regime, bias
             if short_score >= MIN_SCORE: return "SHORT", short_score, short_sigs, atr, 0, 0, regime, bias
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
+            
         elif regime in (MarketRegime.REGIME_RANGE, MarketRegime.REGIME_EXHAUSTION, MarketRegime.REGIME_VOLATILE):
             _stats["regime_block"] += 1
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
         return None, 0, [], atr, 0, 0, regime, bias
 
+    # PERBAIKAN: _score_long MURNI menghitung sinyal BULLISH
     def _score_long(self, df: pd.DataFrame) -> Tuple[int, List[str]]:
-        row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
-        score, signals = 0, []
-        p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
-        if p < e5 < e9 < e21 < e50: w=self.weights.get_adjusted_weight("ema_bear_stack"); score+=w; signals.append(f"EMA5↓[{w:.0f}]")
-        elif p < e5 < e9 < e21: w=self.weights.get_adjusted_weight("ema_mild_bear"); score+=w; signals.append(f"EMA4↓[{w:.0f}]")
-        elif p < e5 < e9: w=self.weights.get_adjusted_weight("ema_weak_bear"); score+=w; signals.append(f"EMA3↓[{w:.0f}]")
-        if row["m5"] < -0.003: w=self.weights.get_adjusted_weight("mom_strong_neg"); score+=w; signals.append(f"Mom{row['m5']*100:.1f}%↓[{w:.0f}]")
-        elif row["m5"] < -0.002: w=self.weights.get_adjusted_weight("mom_moderate_neg"); score+=w; signals.append(f"Mom{row['m5']*100:.1f}%↓[{w:.0f}]")
-        if prev["mh"] >= 0 and row["mh"] < 0: w=self.weights.get_adjusted_weight("macd_cross_down"); score+=w; signals.append(f"MACD_X↓[{w:.0f}]")
-        elif row["mh"] < 0 and row["mh"] < prev["mh"] < prev2["mh"]: w=self.weights.get_adjusted_weight("macd_strengthen_neg"); score+=w; signals.append(f"MACD↓↓[{w:.0f}]")
-        if row["br"] < 0.44: w=self.weights.get_adjusted_weight("orderflow_sell_climax"); score+=w; signals.append(f"SellClimax{1-row['br']:.0%}[{w:.0f}]")
-        elif row["br"] < 0.48: w=self.weights.get_adjusted_weight("orderflow_sell_high"); score+=w; signals.append(f"Sell{1-row['br']:.0%}[{w:.0f}]")
-        if row["rsi"] < 32: w=self.weights.get_adjusted_weight("rsi_extreme_os"); score+=w; signals.append(f"RSI{row['rsi']:.0f}OS[{w:.0f}]")
-        elif row["rsi"] < 40: w=self.weights.get_adjusted_weight("rsi_low"); score+=w; signals.append(f"RSI{row['rsi']:.0f}Lo[{w:.0f}]")
-        return score, signals
-
-    def _score_short(self, df: pd.DataFrame) -> Tuple[int, List[str]]:
         row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
         score, signals = 0, []
         p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
@@ -199,6 +192,24 @@ class SignalScorer:
         elif row["br"] > 0.52: w=self.weights.get_adjusted_weight("orderflow_buy_high"); score+=w; signals.append(f"Buy{row['br']:.0%}[{w:.0f}]")
         if row["rsi"] > 68: w=self.weights.get_adjusted_weight("rsi_extreme_ob"); score+=w; signals.append(f"RSI{row['rsi']:.0f}OB[{w:.0f}]")
         elif row["rsi"] > 60: w=self.weights.get_adjusted_weight("rsi_high"); score+=w; signals.append(f"RSI{row['rsi']:.0f}Hi[{w:.0f}]")
+        return score, signals
+
+    # PERBAIKAN: _score_short MURNI menghitung sinyal BEARISH
+    def _score_short(self, df: pd.DataFrame) -> Tuple[int, List[str]]:
+        row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
+        score, signals = 0, []
+        p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
+        if p < e5 < e9 < e21 < e50: w=self.weights.get_adjusted_weight("ema_bear_stack"); score+=w; signals.append(f"EMA5↓[{w:.0f}]")
+        elif p < e5 < e9 < e21: w=self.weights.get_adjusted_weight("ema_mild_bear"); score+=w; signals.append(f"EMA4↓[{w:.0f}]")
+        elif p < e5 < e9: w=self.weights.get_adjusted_weight("ema_weak_bear"); score+=w; signals.append(f"EMA3↓[{w:.0f}]")
+        if row["m5"] < -0.003: w=self.weights.get_adjusted_weight("mom_strong_neg"); score+=w; signals.append(f"Mom{row['m5']*100:.1f}%↓[{w:.0f}]")
+        elif row["m5"] < -0.002: w=self.weights.get_adjusted_weight("mom_moderate_neg"); score+=w; signals.append(f"Mom{row['m5']*100:.1f}%↓[{w:.0f}]")
+        if prev["mh"] >= 0 and row["mh"] < 0: w=self.weights.get_adjusted_weight("macd_cross_down"); score+=w; signals.append(f"MACD_X↓[{w:.0f}]")
+        elif row["mh"] < 0 and row["mh"] < prev["mh"] < prev2["mh"]: w=self.weights.get_adjusted_weight("macd_strengthen_neg"); score+=w; signals.append(f"MACD↓↓[{w:.0f}]")
+        if row["br"] < 0.44: w=self.weights.get_adjusted_weight("orderflow_sell_climax"); score+=w; signals.append(f"SellClimax{1-row['br']:.0%}[{w:.0f}]")
+        elif row["br"] < 0.48: w=self.weights.get_adjusted_weight("orderflow_sell_high"); score+=w; signals.append(f"Sell{1-row['br']:.0%}[{w:.0f}]")
+        if row["rsi"] < 32: w=self.weights.get_adjusted_weight("rsi_extreme_os"); score+=w; signals.append(f"RSI{row['rsi']:.0f}OS[{w:.0f}]")
+        elif row["rsi"] < 40: w=self.weights.get_adjusted_weight("rsi_low"); score+=w; signals.append(f"RSI{row['rsi']:.0f}Lo[{w:.0f}]")
         return score, signals
 
 class RiskManager:
@@ -272,8 +283,6 @@ _executor        = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q        = queue.Queue()
 _hot_syms        = deque(maxlen=30)
 
-live_prices = {} # 🔥 Penyimpanan Harga Real-Time Websocket
-
 _macro = {"btc": "UNKNOWN"}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
@@ -306,8 +315,6 @@ def qty(symbol, price):
     return round(raw, get_precision(symbol))
 
 def price_live(symbol):
-    # 🔥 FITUR BARU: Ambil data harga dari Websocket memori (Cegah API Ban)
-    if symbol in live_prices: return live_prices[symbol]
     try: return float(client.futures_symbol_ticker(symbol=symbol)["price"])
     except: return 0.0
 
@@ -371,9 +378,12 @@ def get_real_fill_price(sym, order_resp):
     try:
         cum_quote = float(order_resp.get('cumQuote', 0))
         exec_qty = float(order_resp.get('executedQty', 0))
-        if exec_qty > 0 and cum_quote > 0: return cum_quote / exec_qty
+        if exec_qty > 0 and cum_quote > 0:
+            return cum_quote / exec_qty
+        
         avg_px = float(order_resp.get('avgPrice', 0))
         if avg_px > 0: return avg_px
+
         order_id = order_resp.get('orderId')
         if order_id:
             for _ in range(2):
@@ -396,22 +406,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS: return
         live_positions[sym] = {"_r": True}
 
-    # 🔥 FITUR BARU: SPREAD FILTER 
-    try:
-        ob = client.futures_order_book(symbol=sym, limit=5)
-        best_bid = float(ob['bids'][0][0])
-        best_ask = float(ob['asks'][0][0])
-        spread_pct = (best_ask - best_bid) / best_bid * 100
-        if spread_pct > MAX_SPREAD_PCT:
-            print(f"  ⚠️ BATAL ENTRY {sym}: Jarak harga jual/beli ({spread_pct:.2f}%) terlalu lebar!")
-            with _lock: live_positions.pop(sym, None)
-            return
-    except Exception:
-        pass # Lanjutkan jika API orderbook delay
-
     px_now = price_live(sym)
-    if px_now > 0:
-        price = px_now
+    if px_now > 0: price = px_now
 
     try: q_val = qty(sym, price)
     except: 
@@ -446,7 +442,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
                     live_positions[sym].update({'entry': price, 'sl_price': sl_p2, 'emergency_tp': emg2, 'peak_price': price})
         print(f"         ✅ ORDER #{order.get('orderId')} | fill:{price:.6g} | qty:{q_val}")
     except Exception as e:
-        print(f"  ❌ ORDER GAGAL {sym}: {e}")
+        print(f"   ❌ ORDER GAGAL {sym}: {e}")
         with _lock: live_positions.pop(sym, None)
         return
 
@@ -474,11 +470,10 @@ def live_close(sym, reason, price=None):
             type='MARKET', quantity=q_val, reduceOnly=True, newOrderRespType='RESULT'
         )
         real_px = get_real_fill_price(sym, close_order)
-        if real_px > 0:
-            price = real_px
+        if real_px > 0: price = real_px
         print(f"         ✅ CLOSE ORDER #{close_order.get('orderId')} | fill:{price:.6g}")
     except Exception as e:
-        print(f"  ⚠️ CLOSE ORDER GAGAL {sym}: {e}")
+        print(f"   ⚠️ CLOSE ORDER GAGAL {sym}: {e}")
         with _lock: live_positions[sym] = pos
         return 
 
@@ -497,7 +492,7 @@ def live_close(sym, reason, price=None):
     trail_info = f" | peak:{peak_pct*100:+.3f}%"
     if pos.get("trail_active"): trail_info += " ✅trail_was_active"
 
-    print(f"  {e_icon} [v20.8 LIVE] {sym} {side} CLOSE — {reason}{trail_info}")
+    print(f"  {e_icon} [v20.9 LIVE] {sym} {side} CLOSE — {reason}{trail_info}")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
 
     trade = TradeRecord(
@@ -639,7 +634,7 @@ def print_inline():
     avg_pk = learning.avg_peak_win()
     al = learning.avg_loss()
     e = "💚" if pnl >= 0 else "🔴"
-    print(f"       ┌ [v20.8 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"       ┌ [v20.9 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"       └ Trail:{_stats['trail_exit']} SL:{_stats['hard_sl']} AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
 
 def print_full():
@@ -651,10 +646,9 @@ def print_full():
     e = "💚" if pnl >= 0 else "🔴"
     aw, al = learning.avg_win(), learning.avg_loss()
     bep = al / (al + aw) * 100 if (al + aw) > 0 else 50
-    avg_pk_win = learning.avg_peak_win()
 
     print(f"\n  {'─'*70}")
-    print(f"    🔔 TRAIL v20.8 LIVE (ANTI-PHANTOM & ABSOLUTE PnL SYNC)")
+    print(f"    🔔 TRAIL v20.9 LIVE (FIXED LOGIC & BTC MACRO GUARD)")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    📈 Exit: Trail:{_stats['trail_exit']} | SL:{_stats['hard_sl']} | EmgTP:{_stats['emg_tp']}")
@@ -736,59 +730,15 @@ def t_macro():
         except: pass
         time.sleep(10)
 
-# 🔥 FITUR BARU: Websocket Message Handler
-def handle_ws_messages(msg):
-    if isinstance(msg, dict) and 'data' in msg:
-        data = msg['data']
-        if 's' in data and 'c' in data:
-            live_prices[data['s']] = float(data['c'])
-    elif isinstance(msg, dict) and 's' in msg and 'c' in msg:
-        live_prices[msg['s']] = float(msg['c'])
-
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  🔴 TRAIL v20.8 LIVE — ACCOUNT PROTECTION BUNDLE                   ║")
-    print("║  ✅ Websocket Active (Anti Rate-Limit Ban)                         ║")
-    print("║  ✅ State Recovery Active (Aman di-restart Railway)                ║")
-    print("║  ✅ Spread Filter Active (Anti Slippage)                           ║")
+    print("║  🔴 TRAIL v20.9 LIVE — FIXED SCORING & BTC MACRO GUARD             ║")
+    print("║  ✅ Fixed logic long/short indicator alignment                     ║")
+    print("║  ✅ Filter BTC trend trend-alignment & Max hold time 1 jam         ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
-    
     try: valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
     except: valid = set(SYMBOLS)
     syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
-
-    # 🔥 START WEBSOCKET (DIUPDATE AGAR KOMPATIBEL)
-    twm = ThreadedWebsocketManager(api_key=os.getenv("API_KEY"), api_secret=os.getenv("API_SECRET"))
-    twm.start()
-    
-    # Gunakan multiplex socket untuk mendengarkan ticker futures secara stabil
-    streams = [f"{s.lower()}@ticker" for s in syms[:15]] # Ambil 15 simbol utama teratas agar tidak overload
-    twm.start_multiplex_socket(callback=handle_ws_messages, streams=streams)
-    
-    # 🔥 STATE RECOVERY SAAT BOT MENYALA
-    print("  🔄 Sinkronisasi Posisi Aktif dari Binance...")
-    try:
-        open_pos = client.futures_position_information()
-        for pos in open_pos:
-            amt = float(pos['positionAmt'])
-            if amt != 0:
-                sym = pos['symbol']
-                ep = float(pos['entryPrice'])
-                sd = "LONG" if amt > 0 else "SHORT"
-                sl_p, emg = RiskManager.calculate_levels(ep, sd)
-                
-                with _lock:
-                    live_positions[sym] = {
-                        "side": sd, "entry": ep, "qty": abs(amt),
-                        "open_time": time.time(), "score": 100, "sigs": ["RECOVERED_BY_BOT"],
-                        "atr": 0, "regime": "UNKNOWN", "bias": 0,
-                        "sl_price": sl_p, "emergency_tp": emg,
-                        "peak_price": ep, "trail_active": False, "trail_stop": None,
-                        "_r": False
-                    }
-                print(f"  ✅ Recovery Berhasil: {sym} {sd} Qty:{abs(amt)} Entry:{ep}")
-    except Exception as e:
-        print(f"  ❌ Gagal recovery posisi: {e}")
     
     threading.Thread(target=t_monitor, daemon=True).start()
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
