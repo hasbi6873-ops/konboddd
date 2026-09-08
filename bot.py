@@ -1,30 +1,23 @@
 """
-Bot Scalping v21.0 LIVE — SMART POSITIVE EXPECTANCY & BTC MACRO GUARD
-=====================================================================
-PEMBARUAN BESAR & REVOLUSI ALGORITMA:
-1. FIXED INVERTED SCORING BUG:
-   - Mengoreksi logika sinyal yang sebelumnya terbalik. _score_long kini 100% menghitung
-     indikator tren Bullish (EMA stack, Momentum positif, MACD cross up, Volume buy, RSI sehat).
-   - _score_short kini 100% menghitung indikator tren Bearish (EMA bear stack, Momentum negatif,
-     MACD cross down, Volume sell, RSI sehat).
-   - Anti-FOMO: Penalti overbought (RSI > 75 pada long) & oversold (RSI < 25 pada short).
-2. 3-STAGE DYNAMIC RISK MANAGEMENT (POSITIVE EXPECTANCY):
-   - Stage 1: Auto Move-to-Breakeven di +0.75% profit (ROE +15%), mengunci +0.12% untuk menutup fee
-     dan mengubah posisi menjadi Bebas Risiko (Risk-Free).
-   - Stage 2: Profit Lock di +1.20% profit, mengunci minimal +0.60%.
-   - Stage 3: Dynamic Trailing Stop di +1.50% profit dengan gap ketat 0.40% untuk memaksimalkan cuan.
-   - Dynamic ATR Stop Loss: SL adaptif berbasis volatilitas nyata koin (0.9% - 1.8%).
-3. BTC MACRO REGIME & MOMENTUM FILTER:
-   - Filter aktif: Blokir LONG pada altcoin jika BTC sedang TRENDING_BEAR atau dump.
-   - Blokir SHORT pada altcoin jika BTC sedang TRENDING_BULL atau pump.
-   - Perketat MIN_SCORE menjadi 68 jika BTC sedang dalam fase EXHAUSTION / VOLATILE.
-4. SMART CIRCUIT BREAKER & STREAK PROTECTION:
-   - 3x Consecutive Loss Circuit Breaker: Istirahat 15 Menit jika 3 kali loss berturut-turut.
-   - Penalty Cooldown: Cooldown 30 Menit khusus koin yang terkena SL.
-   - Stale Scalp Timeout: Tutup posisi jika sudah 45 Menit stagnan tanpa profit.
-   - Daily Loss Limit: -$3.0 USDT kill switch harian.
-5. FIXED ADAPTIVE LEARNING & WINDOWS UTF-8 ENCODING:
-   - Perbaikan key binding sinyal agar SignalWeights dan LearningLayer benar-benar belajar dari riwayat.
+Bot Scalping v22.0 LIVE — REAL TREND RIDER (Binance Testnet)
+============================================================
+PERBAIKAN TOTAL (HASIL EVALUASI & KALIBRASI NYATA):
+1. MENGHAPUS TOTAL 'STALE_TIMEOUT' (Penyebab 14x Loss Beruntun di v21.0):
+   - Posisi tidak lagi dipaksa cut-loss di menit ke-45 (2700s).
+   - Mengembalikan MAX_HOLD_SECONDS ke 3 Jam (10800s) agar posisi memiliki ruang napas
+     dan waktu yang cukup untuk mengejar target profit seperti versi awal yang berhasil (+5.5U).
+2. MEMULIHKAN TRAILING STOP BESAR (+0.57U Avg Win):
+   - Menghapus Breakeven prematur (+0.75%) yang mencekik profit sehingga rata-rata win anjlok jadi 0.07U.
+   - Trailing Stop aktif di +1.40% dengan Gap 0.40% (mengunci profit minimal +1.00% atau ~$0.40U,
+     dan membiarkan trade berlari mengejar +1.50U+ seperti semula).
+3. ANTI-OVERTRADING & SINKRONISASI PASAR:
+   - Filter ADX >= 23 & Close vs E50: Hanya masuk jika tren benar-benar kuat dan di atas/bawah EMA50.
+   - Slot Entry Delay (45 detik): Mencegah bot langsung memborong 3 koin sekaligus dalam 1 detik.
+   - Threshold Skor Adaptif: MIN_SCORE 60 saat pasar tren, dan 70 saat BTC dalam fase RANGE/CHOP.
+4. CIRCUIT BREAKER & COOLDOWN PENALTY (PELINDUNG DRAWDOWN):
+   - 3x Loss Beruntun -> Auto-Pause 15 Menit agar gejolak pasar mereda.
+   - Koin yang terkena SL -> Dihukum Cooldown 30 Menit (1800s).
+   - Daily Loss Limit -> -$2.50 USDT.
 """
 
 import os
@@ -40,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, List
 
-# Reconfigure stdout to UTF-8 on Windows console if needed
+# Reconfigure stdout to UTF-8 on Windows console
 if hasattr(sys.stdout, 'reconfigure'):
     try:
         sys.stdout.reconfigure(encoding='utf-8')
@@ -52,7 +45,6 @@ from binance.client import Client
 import ta
 
 load_dotenv()
-# Menggunakan testnet=True secara langsung untuk mencegah masalah SSL handshake ke api.binance.com
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"), testnet=True)
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
@@ -64,48 +56,33 @@ LEVERAGE      = 20
 ORDER_USDT    = 2.0
 MAX_POSITIONS = 3
 
-# Scanning
-SCAN_INTERVAL = 2.0
-MONITOR_INT   = 0.1
-BATCH_SIZE    = 15
-MAX_WORKERS   = 5
-SLOT_FILL_INT = 0.01
-COOLDOWN_SEC    = 180    # 3 Menit jeda setelah win/BE
-SL_COOLDOWN_SEC = 1800   # 30 Menit penalty jeda jika kena SL agar tidak mengulang loss
+# Scanning & Throttling
+SCAN_INTERVAL   = 3.0    # 3 Detik jeda scan agar tidak membebani koneksi
+MONITOR_INT     = 0.1
+BATCH_SIZE      = 15
+MAX_WORKERS     = 5
+SLOT_FILL_INT   = 0.05
+ENTRY_DELAY_SEC = 45     # Minimal jeda 45 detik antar pembukaan posisi (Anti-Spam Slot)
+COOLDOWN_SEC    = 180    # 3 Menit jeda koin setelah win
+SL_COOLDOWN_SEC = 1800   # 30 Menit penalty jeda untuk koin yang kena SL
 
 # Scoring & Filter
-MIN_SCORE      = 55
-MIN_SCORE_CHOP = 68      # Jika BTC EXHAUSTION/VOLATILE, butuh score lebih tinggi
-SLIPPAGE_GUARD = 0.0015
+MIN_SCORE      = 60      # Minimal skor 60 untuk sinyal tren berkualitas
+MIN_SCORE_CHOP = 70      # Minimal skor 70 jika BTC sedang RANGE / EXHAUSTION
 TTL_5M         = 2
 
-# ── 3-Stage Dynamic Risk Management v21.0 ──────────────────────────────────
-SL_PCT_DEFAULT     = 0.012   # Default 1.2%
-SL_PCT_MIN         = 0.009   # Min SL 0.9%
-SL_PCT_MAX         = 0.018   # Max SL 1.8%
-ATR_SL_MULT        = 1.4     # Pengali ATR untuk SL adaptif
-
-# Stage 1: Breakeven (Auto-Protect)
-BE_TRIGGER_PCT     = 0.0075  # Trigger BE saat profit +0.75% (ROE +15%)
-BE_LOCK_PCT        = 0.0012  # Kunci di +0.12% (menutup taker fee 0.10% + locked profit)
-
-# Stage 2: Profit Lock
-STAGE2_TRIGGER_PCT = 0.0120  # Trigger lock saat profit +1.20%
-STAGE2_LOCK_PCT    = 0.0060  # Kunci profit minimal +0.60%
-
-# Stage 3: Dynamic Trailing Stop
-TRAIL_ACTIVATE_PCT = 0.0150  # Trailing aktif di +1.50%
-TRAIL_GAP_PCT      = 0.0040  # Gap diperketat ke 0.40% agar profit terselamatkan
-
-EMERGENCY_TP_PCT   = 0.0350  # Emergency hard TP 3.5%
-STALE_HOLD_SECONDS = 2700    # 45 Menit: Tutup jika trade stagnan/tidak bergerak profit
-MAX_HOLD_SECONDS   = 7200    # Maksimal tahan posisi 2 Jam
+# ── Dynamic Risk Management v22.0 (Trend Rider) ───────────────────────────
+SL_PCT             = 0.012   # Stop Loss 1.2% (~$0.50U risiko per trade)
+TRAIL_ACTIVATE_PCT = 0.014   # Trailing aktif di +1.40% profit
+TRAIL_GAP_PCT      = 0.004   # Gap 0.40% (Mengunci minimal +1.00% atau ~$0.40U bersih)
+EMERGENCY_TP_PCT   = 0.040   # Emergency TP 4.0%
+MAX_HOLD_SECONDS   = 10800   # Maksimal tahan posisi 3 Jam (10800s) — TIDAK ADA STALE CUT!
 # ──────────────────────────────────────────────────────────────────────────
 
 # Smart Circuit Breaker & Streak Protection
-DAILY_LOSS   = -3.0   # Stop jika rugi harian >= -3.0 USDT
+DAILY_LOSS   = -2.50  # Stop jika rugi harian >= -2.50 USDT
 CONSEC_MAX   = 3      # Maksimal 3 loss berturut-turut
-CONSEC_PAUSE = 900    # Istirahat 15 Menit jika 3 loss beruntun
+CONSEC_PAUSE = 900    # Istirahat 15 Menit jika terkena 3 loss beruntun
 
 # Learning
 LEARNING_WINDOW       = 200
@@ -148,8 +125,8 @@ class MarketRegime:
         bear_stack = close < e5 < e9 < e21 < e50
         mild_bull  = close > e9 > e21
         mild_bear  = close < e9 < e21
-        strong_trend      = adx > 25
-        very_strong_trend = adx > 35
+        strong_trend      = adx >= 23
+        very_strong_trend = adx >= 32
         atr_expand  = (atr / atr_prev) > 1.2 if atr_prev > 0 else False
         atr_collapse = (atr / atr_prev) < 0.8 if atr_prev > 0 else False
         m5, m5_prev = row["m5"], prev["m5"]
@@ -164,28 +141,27 @@ class MarketRegime:
         else: return MarketRegime.REGIME_RANGE, 30, 0
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SIGNAL WEIGHTS & SCORING (DIPERBAIKI SECARA MATEMATIS)
+#  SIGNAL WEIGHTS & SCORING (HIGH PROBABILITY TREND FILTER)
 # ═══════════════════════════════════════════════════════════════════════════
 class SignalWeights:
     def __init__(self):
         self.weights = {
             # Bullish Signals
-            "ema_bull_stack": 35, "ema_mild_bull": 26, "ema_weak_bull": 14,
+            "ema_bull_stack": 35, "ema_mild_bull": 25, "ema_weak_bull": 15,
             "mom_strong": 30, "mom_moderate": 20, "macd_cross_up": 22, "macd_strengthen": 15,
             "orderflow_buy_climax": 25, "orderflow_buy_high": 14,
-            "rsi_healthy_bull": 20, "rsi_pullback_bull": 12,
+            "rsi_healthy_bull": 20, "rsi_pullback_bull": 15,
             # Bearish Signals
-            "ema_bear_stack": 35, "ema_mild_bear": 26, "ema_weak_bear": 14,
+            "ema_bear_stack": 35, "ema_mild_bear": 25, "ema_weak_bear": 15,
             "mom_strong_neg": 30, "mom_moderate_neg": 20, "macd_cross_down": 22, "macd_strengthen_neg": 15,
             "orderflow_sell_climax": 25, "orderflow_sell_high": 14,
-            "rsi_healthy_bear": 20, "rsi_bounce_bear": 12,
+            "rsi_healthy_bear": 20, "rsi_bounce_bear": 15,
         }
         self.history = defaultdict(list)
         self.adaptive_enabled = True
 
     def record_outcome(self, signals: List[str], won: bool):
         for sig in signals:
-            # Parse format "base_key:display"
             base = sig.split(':')[0].strip()
             if base in self.weights:
                 self.history[base].append(1 if won else 0)
@@ -209,18 +185,21 @@ class SignalScorer:
         long_score, long_sigs = self._score_long(df)
         short_score, short_sigs = self._score_short(df)
         atr = df["atr"].iloc[-2]
+        adx = df["adx"].iloc[-2]
+
+        # Validasi tren: ADX harus minimal 23 untuk menjamin ada pergerakan tren
+        if adx < 23:
+            return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
 
         # Filter Makro BTC
         btc_reg = _macro.get("btc", "UNKNOWN")
         btc_m5 = _macro.get("btc_m5", 0.0)
-        min_required = MIN_SCORE
-        if btc_reg in (MarketRegime.REGIME_EXHAUSTION, MarketRegime.REGIME_VOLATILE):
-            min_required = MIN_SCORE_CHOP
+        min_required = MIN_SCORE_CHOP if btc_reg in (MarketRegime.REGIME_RANGE, MarketRegime.REGIME_EXHAUSTION, MarketRegime.REGIME_VOLATILE) else MIN_SCORE
 
         # 1. Bullish Regime
         if regime == MarketRegime.REGIME_TRENDING_BULL:
             # Proteksi Makro BTC: Jangan Long jika BTC sedang Bearish atau Dump
-            if symbol != "BTCUSDT" and (btc_reg == MarketRegime.REGIME_TRENDING_BEAR or btc_m5 < -0.004):
+            if symbol != "BTCUSDT" and (btc_reg == MarketRegime.REGIME_TRENDING_BEAR or btc_m5 < -0.003):
                 _stats["regime_block"] += 1
                 return None, long_score, ["BTC_BEAR_BLOCK"], atr, 0, 0, regime, bias
 
@@ -232,7 +211,7 @@ class SignalScorer:
         # 2. Bearish Regime
         elif regime == MarketRegime.REGIME_TRENDING_BEAR:
             # Proteksi Makro BTC: Jangan Short jika BTC sedang Bullish atau Pump
-            if symbol != "BTCUSDT" and (btc_reg == MarketRegime.REGIME_TRENDING_BULL or btc_m5 > 0.004):
+            if symbol != "BTCUSDT" and (btc_reg == MarketRegime.REGIME_TRENDING_BULL or btc_m5 > 0.003):
                 _stats["regime_block"] += 1
                 return None, short_score, ["BTC_BULL_BLOCK"], atr, 0, 0, regime, bias
 
@@ -241,7 +220,7 @@ class SignalScorer:
                 return "SHORT", short_score, display_sigs, atr, 0, 0, regime, bias
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
 
-        # 3. Non-trending Regimes
+        # 3. Non-trending Regimes (Block chop)
         elif regime in (MarketRegime.REGIME_RANGE, MarketRegime.REGIME_EXHAUSTION, MarketRegime.REGIME_VOLATILE):
             _stats["regime_block"] += 1
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
@@ -249,12 +228,14 @@ class SignalScorer:
         return None, 0, [], atr, 0, 0, regime, bias
 
     def _score_long(self, df: pd.DataFrame) -> Tuple[int, List[str]]:
-        """Mengevaluasi kekuatan sinyal BULLISH sejati."""
         row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
         score, signals = 0, []
         p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
 
-        # EMA Bull Stack
+        # Filter Utama: Harga HARUS di atas EMA50 untuk memastikan tren besar naik
+        if p < e50: return 0, []
+
+        # EMA Stack Bullish
         if p > e5 > e9 > e21 > e50:
             w = self.weights.get_adjusted_weight("ema_bull_stack")
             score += w; signals.append(f"ema_bull_stack:EMA5↑[{w:.0f}]")
@@ -281,7 +262,7 @@ class SignalScorer:
             w = self.weights.get_adjusted_weight("macd_strengthen")
             score += w; signals.append(f"macd_strengthen:MACD↑↑[{w:.0f}]")
 
-        # Orderflow Buy Volume
+        # Orderflow Volume Beli
         if row["br"] > 0.58:
             w = self.weights.get_adjusted_weight("orderflow_buy_climax")
             score += w; signals.append(f"orderflow_buy_climax:BuyClimax{row['br']:.0%}[{w:.0f}]")
@@ -290,25 +271,26 @@ class SignalScorer:
             score += w; signals.append(f"orderflow_buy_high:Buy{row['br']:.0%}[{w:.0f}]")
 
         # RSI Zone & Anti-FOMO Guard
-        if row["rsi"] > 75:
-            # Overbought penalty: jangan buy di pucuk!
-            score -= 25; signals.append(f"rsi_penalty:RSI_{row['rsi']:.0f}_OB_PENALTY[-25]")
-        elif 52 <= row["rsi"] <= 68:
+        if row["rsi"] > 72:
+            score -= 30; signals.append(f"rsi_penalty:RSI_{row['rsi']:.0f}_OB_PENALTY[-30]")
+        elif 50 <= row["rsi"] <= 68:
             w = self.weights.get_adjusted_weight("rsi_healthy_bull")
             score += w; signals.append(f"rsi_healthy_bull:RSI_{row['rsi']:.0f}_Bull[{w:.0f}]")
-        elif 42 <= row["rsi"] < 52:
+        elif 42 <= row["rsi"] < 50:
             w = self.weights.get_adjusted_weight("rsi_pullback_bull")
-            score += w; signals.append(f"rsi_pullback_bull:RSI_{row['rsi']:.0f}_Pullback[{w:.0f}]")
+            score += w; signals.append(f"rsi_pullback_bull:RSI_{row['rsi']:.0f}_Dip[{w:.0f}]")
 
         return max(0, score), signals
 
     def _score_short(self, df: pd.DataFrame) -> Tuple[int, List[str]]:
-        """Mengevaluasi kekuatan sinyal BEARISH sejati."""
         row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
         score, signals = 0, []
         p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
 
-        # EMA Bear Stack
+        # Filter Utama: Harga HARUS di bawah EMA50 untuk memastikan tren besar turun
+        if p > e50: return 0, []
+
+        # EMA Stack Bearish
         if p < e5 < e9 < e21 < e50:
             w = self.weights.get_adjusted_weight("ema_bear_stack")
             score += w; signals.append(f"ema_bear_stack:EMA5↓[{w:.0f}]")
@@ -335,7 +317,7 @@ class SignalScorer:
             w = self.weights.get_adjusted_weight("macd_strengthen_neg")
             score += w; signals.append(f"macd_strengthen_neg:MACD↓↓[{w:.0f}]")
 
-        # Orderflow Sell Volume
+        # Orderflow Volume Jual
         if row["br"] < 0.42:
             w = self.weights.get_adjusted_weight("orderflow_sell_climax")
             score += w; signals.append(f"orderflow_sell_climax:SellClimax{1-row['br']:.0%}[{w:.0f}]")
@@ -344,13 +326,12 @@ class SignalScorer:
             score += w; signals.append(f"orderflow_sell_high:Sell{1-row['br']:.0%}[{w:.0f}]")
 
         # RSI Zone & Anti-Dump Guard
-        if row["rsi"] < 25:
-            # Oversold penalty: jangan short di dasar jurang!
-            score -= 25; signals.append(f"rsi_penalty:RSI_{row['rsi']:.0f}_OS_PENALTY[-25]")
-        elif 32 <= row["rsi"] <= 48:
+        if row["rsi"] < 28:
+            score -= 30; signals.append(f"rsi_penalty:RSI_{row['rsi']:.0f}_OS_PENALTY[-30]")
+        elif 32 <= row["rsi"] <= 50:
             w = self.weights.get_adjusted_weight("rsi_healthy_bear")
             score += w; signals.append(f"rsi_healthy_bear:RSI_{row['rsi']:.0f}_Bear[{w:.0f}]")
-        elif 48 < row["rsi"] <= 58:
+        elif 50 < row["rsi"] <= 58:
             w = self.weights.get_adjusted_weight("rsi_bounce_bear")
             score += w; signals.append(f"rsi_bounce_bear:RSI_{row['rsi']:.0f}_Bounce[{w:.0f}]")
 
@@ -358,21 +339,10 @@ class SignalScorer:
 
 class RiskManager:
     @staticmethod
-    def calculate_levels(entry_price: float, side: str, atr: float = 0.0) -> Tuple[float, float, float]:
-        """Menghitung Stop Loss adaptif berbasis ATR nyata dan Emergency TP."""
-        if entry_price > 0 and atr > 0:
-            raw_sl = (atr * ATR_SL_MULT) / entry_price
-            sl_pct = max(SL_PCT_MIN, min(SL_PCT_MAX, raw_sl))
-        else:
-            sl_pct = SL_PCT_DEFAULT
-
+    def calculate_levels(entry_price: float, side: str) -> Tuple[float, float]:
         if side == "LONG":
-            sl_price = entry_price * (1 - sl_pct)
-            emg_tp   = entry_price * (1 + EMERGENCY_TP_PCT)
-        else:
-            sl_price = entry_price * (1 + sl_pct)
-            emg_tp   = entry_price * (1 - EMERGENCY_TP_PCT)
-        return sl_price, emg_tp, sl_pct
+            return entry_price * (1 - SL_PCT), entry_price * (1 + EMERGENCY_TP_PCT)
+        return entry_price * (1 + SL_PCT), entry_price * (1 - EMERGENCY_TP_PCT)
 
 @dataclass
 class TradeRecord:
@@ -441,12 +411,13 @@ _lock            = threading.Lock()
 _executor        = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q        = queue.Queue()
 _hot_syms        = deque(maxlen=30)
+_last_open_time  = 0.0  # Waktu terakhir pembukaan posisi (Throttle anti-spam)
 
 _macro = {"btc": "UNKNOWN", "btc_m5": 0.0, "btc_adx": 0.0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "trail_exit": 0, "be_exit": 0, "hard_sl": 0, "emg_tp": 0, "stale_exit": 0,
+    "trail_exit": 0, "hard_sl": 0, "emg_tp": 0, "time_exit": 0,
     "regime_block": 0, "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -566,6 +537,13 @@ def get_real_fill_price(sym, order_resp):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
+    global _last_open_time
+    now = time.time()
+
+    # Slot throttling: Beri jeda minimal 45 detik antar entry agar tidak borong slot saat market spike
+    if now - _last_open_time < ENTRY_DELAY_SEC:
+        return
+
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS: return
         live_positions[sym] = {"_r": True}
@@ -579,15 +557,14 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
         with _lock: live_positions.pop(sym, None)
         return
 
-    sl_price, emg_tp, sl_pct = RiskManager.calculate_levels(price, orig_direction, atr)
+    sl_price, emg_tp = RiskManager.calculate_levels(price, orig_direction)
 
     pos = {
         "side": orig_direction, "entry": price, "qty": q_val,
         "open_time": time.time(), "score": score, "sigs": sigs,
         "atr": atr, "regime": regime, "bias": bias,
-        "sl_price": sl_price, "emergency_tp": emg_tp, "sl_pct": sl_pct,
+        "sl_price": sl_price, "emergency_tp": emg_tp,
         "peak_price": price,
-        "be_active": False, "stage2_active": False,
         "trail_active": False, "trail_stop": None,
     }
     with _lock: live_positions[sym] = pos
@@ -600,15 +577,15 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
             symbol=sym, side='BUY' if orig_direction == 'LONG' else 'SELL',
             type='MARKET', quantity=q_val, newOrderRespType='RESULT'
         )
+        _last_open_time = time.time()
         real_px = get_real_fill_price(sym, order)
         if real_px > 0:
             price = real_px
-            sl_p2, emg2, sl_pct2 = RiskManager.calculate_levels(price, orig_direction, atr)
+            sl_p2, emg2 = RiskManager.calculate_levels(price, orig_direction)
             with _lock:
                 if sym in live_positions and not live_positions[sym].get('_r'):
                     live_positions[sym].update({
-                        'entry': price, 'sl_price': sl_p2, 'emergency_tp': emg2,
-                        'sl_pct': sl_pct2, 'peak_price': price
+                        'entry': price, 'sl_price': sl_p2, 'emergency_tp': emg2, 'peak_price': price
                     })
         print(f"         ✅ ORDER #{order.get('orderId')} | fill:{price:.6g} | qty:{q_val}")
     except Exception as e:
@@ -617,7 +594,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
         return
 
     d = "🟢" if orig_direction == "LONG" else "🔴"
-    print(f"\n  {d} [v21.0 SMART] {sym} {orig_direction} @{price:.6g} | SL:{sl_pct*100:.2f}% (ATR:{atr:.4g}) | Trail:±{TRAIL_GAP_PCT*100:.2f}% | Regime:{regime}")
+    print(f"\n  {d} [v22.0 RIDER] {sym} {orig_direction} @{price:.6g} | SL:{SL_PCT*100:.2f}% | Trail:±{TRAIL_GAP_PCT*100:.2f}% | Regime:{regime}")
     print(f"         Signals: {' | '.join(sigs[:5])}")
     _stats["trades"] += 1
 
@@ -662,10 +639,9 @@ def live_close(sym, reason, price=None):
     peak_pct = (peak_px - entry) / entry if side == "LONG" else (entry - peak_px) / entry
 
     trail_info = f" | peak:{peak_pct*100:+.3f}%"
-    if pos.get("be_active"): trail_info += " 🛡️BE_protected"
     if pos.get("trail_active"): trail_info += " ✅trail_active"
 
-    print(f"  {e_icon} [v21.0 CLOSE] {sym} {side} — {reason}{trail_info}")
+    print(f"  {e_icon} [v22.0 CLOSE] {sym} {side} — {reason}{trail_info}")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
 
     trade = TradeRecord(
@@ -688,17 +664,16 @@ def live_close(sym, reason, price=None):
         if pnl < _stats["worst"]: _stats["worst"] = pnl
 
     if "TRAIL" in reason: _stats["trail_exit"] += 1
-    elif "BE_EXIT" in reason: _stats["be_exit"] += 1
     elif "SL" in reason: _stats["hard_sl"] += 1
     elif "TP" in reason: _stats["emg_tp"] += 1
-    elif "STALE" in reason: _stats["stale_exit"] += 1
+    elif "TIME" in reason: _stats["time_exit"] += 1
 
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7), "exit": round(price, 7),
         "pnl": round(pnl, 5), "reason": reason, "hold": int(hold),
     })
 
-    # Cooldown adaptif: koin yang kena SL dihukum jeda 30 menit
+    # Cooldown adaptif: jika trade kalah (SL), penalti cooldown 30 menit khusus koin ini
     cool_time = SL_COOLDOWN_SEC if not won else COOLDOWN_SEC
     with _lock: cooldown_list[sym] = time.time() + cool_time
     _hot_syms.appendleft(sym)
@@ -706,7 +681,7 @@ def live_close(sym, reason, price=None):
     print_inline()
 
 def monitor_positions():
-    """3-Stage Dynamic Risk Management: Breakeven -> Lock Profit -> Dynamic Trailing."""
+    """Memantau posisi dengan Trailing Stop bebas hambatan tanpa pemotongan prematur."""
     for sym in list(live_positions.keys()):
         pos = live_positions.get(sym)
         if pos is None or pos.get("_r"): continue
@@ -716,68 +691,39 @@ def monitor_positions():
         side, entry, sl_px, emg_tp = pos["side"], pos["entry"], pos["sl_price"], pos["emergency_tp"]
         hold_time = time.time() - pos["open_time"]
 
-        # Current & Peak profit calculations
-        cur_profit = (px - entry) / entry if side == "LONG" else (entry - px) / entry
+        # 1. Batas Maksimal Waktu Tahan: 3 Jam (10800s) — Trade diberikan ruang penuh untuk berayun
+        if hold_time > MAX_HOLD_SECONDS:
+            live_close(sym, "TIME_LIMIT", px)
+            continue
+
+        # Update Peak Price
         if side == "LONG":
             if px > pos["peak_price"]: pos["peak_price"] = px
         else:
             if px < pos["peak_price"]: pos["peak_price"] = px
         peak = pos["peak_price"]
-        peak_profit = (peak - entry) / entry if side == "LONG" else (entry - peak) / entry
 
-        # 1. Stale Scalp Timeout: Jika 45 menit stagnan tanpa profit, keluar dengan aman
-        if hold_time > STALE_HOLD_SECONDS and cur_profit < 0.002:
-            live_close(sym, "STALE_TIMEOUT", px)
-            continue
-
-        # 2. Hard Max Hold Limit (2 jam)
-        if hold_time > MAX_HOLD_SECONDS:
-            live_close(sym, "TIME_LIMIT", px)
-            continue
-
-        # 3. Emergency Hard TP
-        if side == "LONG" and px >= emg_tp: live_close(sym, "TP_EMG", emg_tp); continue
-        if side == "SHORT" and px <= emg_tp: live_close(sym, "TP_EMG", emg_tp); continue
-
-        # 4. Stop Loss / Breakeven Hit
+        # 2. Hard Stop Loss
         if side == "LONG" and px <= sl_px:
-            reason = "BE_EXIT" if pos.get("be_active") else "SL"
-            live_close(sym, reason, sl_px)
-            continue
+            live_close(sym, "SL", sl_px); continue
         if side == "SHORT" and px >= sl_px:
-            reason = "BE_EXIT" if pos.get("be_active") else "SL"
-            live_close(sym, reason, sl_px)
-            continue
+            live_close(sym, "SL", sl_px); continue
 
-        # 5. Stage 1: Auto Move-to-Breakeven at +0.75% profit
-        if peak_profit >= BE_TRIGGER_PCT and not pos.get("be_active"):
-            pos["be_active"] = True
-            if side == "LONG":
-                be_px = entry * (1 + BE_LOCK_PCT)
-                if be_px > pos["sl_price"]: pos["sl_price"] = be_px
-            else:
-                be_px = entry * (1 - BE_LOCK_PCT)
-                if be_px < pos["sl_price"]: pos["sl_price"] = be_px
-            print(f"  🛡️ [BREAKEVEN ON] {sym} {side} | peak:{peak_profit*100:+.2f}% | SL moved to BE: {pos['sl_price']:.6g}")
+        # 3. Emergency Hard TP (+4.0%)
+        if side == "LONG" and px >= emg_tp:
+            live_close(sym, "TP_EMG", emg_tp); continue
+        if side == "SHORT" and px <= emg_tp:
+            live_close(sym, "TP_EMG", emg_tp); continue
 
-        # 6. Stage 2: Lock Profit at +1.20% profit
-        if peak_profit >= STAGE2_TRIGGER_PCT and not pos.get("stage2_active"):
-            pos["stage2_active"] = True
-            if side == "LONG":
-                lock_px = entry * (1 + STAGE2_LOCK_PCT)
-                if lock_px > pos["sl_price"]: pos["sl_price"] = lock_px
-            else:
-                lock_px = entry * (1 - STAGE2_LOCK_PCT)
-                if lock_px < pos["sl_price"]: pos["sl_price"] = lock_px
-            print(f"  🔒 [PROFIT LOCK ON] {sym} {side} | peak:{peak_profit*100:+.2f}% | SL locked to +0.6%: {pos['sl_price']:.6g}")
-
-        # 7. Stage 3: Dynamic Trailing Stop at +1.50% profit
+        # 4. Aktivasi Trailing Stop di +1.40%
         if not pos["trail_active"]:
-            if peak_profit >= TRAIL_ACTIVATE_PCT:
+            profit_pct = (peak - entry) / entry if side == "LONG" else (entry - peak) / entry
+            if profit_pct >= TRAIL_ACTIVATE_PCT:
                 pos["trail_active"] = True
                 pos["trail_stop"] = peak * (1 - TRAIL_GAP_PCT) if side == "LONG" else peak * (1 + TRAIL_GAP_PCT)
-                print(f"  🔔 [TRAIL ON] {sym} {side} | peak:{peak_profit*100:+.2f}% | trail_stop:{pos['trail_stop']:.6g}")
+                print(f"  🔔 [TRAIL ON] {sym} {side} | profit:{profit_pct*100:.3f}% | trail_stop:{pos['trail_stop']:.6g}")
 
+        # 5. Trailing Stop Execution
         if pos["trail_active"]:
             ts = pos["trail_stop"]
             if side == "LONG":
@@ -854,8 +800,8 @@ def print_inline():
     aw = learning.avg_win()
     avg_pk = learning.avg_peak_win()
     e = "💚" if pnl >= 0 else "🔴"
-    print(f"       ┌ [v21.0 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
-    print(f"       └ Trail:{_stats['trail_exit']} BE:{_stats['be_exit']} SL:{_stats['hard_sl']} AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
+    print(f"       ┌ [v22.0 RIDER] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"       └ Trail:{_stats['trail_exit']} SL:{_stats['hard_sl']} AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -868,10 +814,10 @@ def print_full():
     bep = al / (al + aw) * 100 if (al + aw) > 0 else 50
 
     print(f"\n  {'─'*70}")
-    print(f"    🔔 SMART SCALPER v21.0 (POSITIVE EXPECTANCY & BTC GUARD)")
+    print(f"    🔔 TREND RIDER v22.0 (HIGH EXPECTANCY & REVERSAL GUARD)")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"    📈 Exit: Trail:{_stats['trail_exit']} | BE:{_stats['be_exit']} | SL:{_stats['hard_sl']} | EmgTP:{_stats['emg_tp']} | Stale:{_stats['stale_exit']}")
+    print(f"    📈 Exit: Trail:{_stats['trail_exit']} | SL:{_stats['hard_sl']} | EmgTP:{_stats['emg_tp']} | TimeLimit:{_stats['time_exit']}")
     print(f"    💰 Avg Win:{aw:+.5f}U | Avg Loss:{-al:+.5f}U | BEP WR:{bep:.1f}%")
     print(f"    🌐 BTC Macro: {_macro.get('btc', 'UNKNOWN')} (Mom:{_macro.get('btc_m5', 0)*100:+.2f}%)")
 
@@ -899,6 +845,10 @@ def t_slot_filler(syms):
             if slots <= 0 or ks_check()[0]:
                 time.sleep(SLOT_FILL_INT); continue
 
+            # Throttle slot fill jika baru saja membuka posisi dalam 45 detik
+            if time.time() - _last_open_time < ENTRY_DELAY_SEC:
+                time.sleep(1.0); continue
+
             now = time.time()
             with _lock:
                 valid_syms = [s for s in syms if s not in live_positions and (s not in cooldown_list or now > cooldown_list[s])]
@@ -920,6 +870,8 @@ def t_slot_filler(syms):
                     if len(live_positions) >= MAX_POSITIONS: break
                     sym, od, sc, sg, px, atr, regime, bias = r
                     live_open(od, sc, sg, px, atr, regime, bias, sym)
+                    # Hanya buka 1 posisi per siklus agar terdistribusi dengan baik
+                    break
         except Exception:
             pass
         time.sleep(SLOT_FILL_INT)
@@ -928,9 +880,12 @@ def t_rescan(syms):
     while True:
         try:
             _rescan_q.get(timeout=5)
-            time.sleep(0.05)
+            time.sleep(0.5)
             slots = MAX_POSITIONS - len(live_positions)
             if slots <= 0 or ks_check()[0]: continue
+
+            if time.time() - _last_open_time < ENTRY_DELAY_SEC:
+                continue
 
             now = time.time()
             with _lock:
@@ -945,15 +900,17 @@ def t_rescan(syms):
                     if len(live_positions) >= MAX_POSITIONS: break
                     sym, od, sc, sg, px, atr, regime, bias = r
                     live_open(od, sc, sg, px, atr, regime, bias, sym)
+                    break
         except Exception:
             pass
 
 def t_macro():
-    """Memantau rezim dan momentum BTC secara real-time sebagai filter pelindung altcoin."""
+    """Memantau rezim dan momentum BTC secara berkala."""
     while True:
         try:
             df_btc = ohlcv("BTCUSDT", Client.KLINE_INTERVAL_5MINUTE, 80)
             if df_btc is not None and len(df_btc) >= 55:
+                df_btc = run_ta(df_btc)
                 reg, strength, bias = MarketRegime.detect(df_btc)
                 m5 = float(df_btc["m5"].iloc[-2]) if "m5" in df_btc.columns and not np.isnan(df_btc["m5"].iloc[-2]) else 0.0
                 adx = float(df_btc["adx"].iloc[-2]) if "adx" in df_btc.columns and not np.isnan(df_btc["adx"].iloc[-2]) else 0.0
@@ -966,11 +923,11 @@ def t_macro():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  🟢 SMART SCALPER v21.0 LIVE — POSITIVE EXPECTANCY & BTC GUARD     ║")
-    print("║  ✅ Fixed Scoring Bug: Masuk posisi searah tren sesungguhnya       ║")
-    print("║  ✅ 3-Stage Dynamic Risk: Breakeven (+0.75%) & Profit Lock (+1.2%) ║")
-    print("║  ✅ Macro BTC Filter: Blokir Long saat BTC dump, Blokir Short pump ║")
-    print("║  ✅ Anti-Loss Streak: 15m Cool-off pada 3x Loss, 30m Penalty SL    ║")
+    print("║  🟢 TREND RIDER v22.0 LIVE — HIGH EXPECTANCY & REAL TRAILING       ║")
+    print("║  ✅ Hapus Stale Timeout: Biarkan posisi bernapas hingga target TP  ║")
+    print("║  ✅ Trailing Stop +1.4% (Gap 0.4%): Mengunci cuan maksimal         ║")
+    print("║  ✅ Anti-Spam Entry: Jeda 45s per posisi & ADX >= 23 Filter Tren   ║")
+    print("║  ✅ Circuit Breaker: Istirahat 15 Menit saat 3x Loss Beruntun      ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try: valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
     except: valid = set(SYMBOLS)
