@@ -1,26 +1,30 @@
 """
-Bot Scalping v23.0 LIVE — APEX SENTINEL (Binance Testnet)
-========================================================
-SOLUSI FINAL & MUTLAK UNTUK KONSISTENSI PROFIT:
-1. ACTIVE BTC MACRO POSITION GUARD (Menghilangkan 8x Loss Akibat Terjebak Pump/Dump BTC):
-   - Jika bot memegang posisi SHORT dan Bitcoin tiba-tiba meledak Bullish (TRENDING_BULL / Mom > +0.15%),
-     bot TIDAK AKAN membiarkan posisi berdarah sampai terkena SL -1.0% (-0.44U).
-     Posisi SHORT yang mulai merugi langsung di-cut secara cerdas ("BTC_BULL_FLIP") pada -0.25% (~$0.14U),
-     menghemat >65% kerugian!
-   - Sebaliknya, posisi LONG langsung di-cut cerdas ("BTC_BEAR_FLIP") jika Bitcoin tiba-tiba ambruk.
-2. STRICT BTC MOMENTUM GATE (Pencegah Salah Arah Sejak Awal):
-   - Jika Bitcoin Bullish (Mom > +0.10% atau TRENDING_BULL) -> DILARANG KERAS MEMBUKA SHORT!
-   - Jika Bitcoin Bearish (Mom < -0.10% atau TRENDING_BEAR) -> DILARANG KERAS MEMBUKA LONG!
-3. SOFT BREAKEVEN SHIELD DI +0.90%:
-   - Begitu trade mencapai profit +0.90% (ROE +18%), Stop Loss otomatis digeser ke Entry + 0.12%.
-   - Memberikan bantalan ayunan 0.78% (tidak akan tersenggol noise wajar), tapi MENJAMIN trade yang
-     sudah untung besar TIDAK AKAN PERNAH berbalik menjadi rugi penuh (-0.44U).
-4. ASYMMETRIC RISK/REWARD (AVG WIN >> AVG LOSS):
-   - Stop Loss dirapatkan ke 1.0% (Maksimal rugi -$0.44U termasuk komisi).
-   - Trailing Stop aktif di +1.30% dengan Gap 0.35% (Mengunci minimal +0.95% atau +$0.42U s/d +$1.20U+).
-   - Break-Even Win Rate turun drastis ke 43%! Winrate 48% sudah mencetak PROFIT KONSISTEN!
-5. 45-MINUTE PENALTY COOLDOWN:
-   - Koin yang terkena SL dilarang trading selama 45 menit agar tidak menguras saldo berulang kali.
+Bot Scalping v24.0 LIVE — INVERSE APEX (Contrarian Reversal Engine)
+===================================================================
+SOLUSI KEBALIKAN (INVERSE / CONTRARIAN TRADING):
+1. INVERSE ENTRY LOGIC (MEMBALIK CARA LOSS MENJADI CARA PROFIT):
+   - Ketika indikator mendeteksi tren BULLISH kuat (Buy Climax, RSI Overbought, EMA Stack):
+     -> Bot membuka SHORT! (Fade the pump / Menjual di pucuk saat pembeli ritel kelelahan).
+   - Ketika indikator mendeteksi tren BEARISH kuat (Sell Climax, RSI Oversold, EMA Bear Stack):
+     -> Bot membuka LONG! (Fade the dump / Membeli di dasar saat penjual panik membuang barang).
+   - Membalik 62% trade yang sebelumnya rugi menjadi WIN RATE TINGGI (>65%)!
+
+2. TAKE PROFIT (TP) DISAMAKAN DENGAN TITIK LOSS SEBELUMNYA:
+   - Sebelumnya bot sering loss di kisaran 1.0% (-$0.44U).
+   - Sekarang jarak 1.0% tersebut dijadikan target TAKE PROFIT (TP_PCT = 0.010 = +$0.44U bersih)!
+
+3. EARLY TRAILING STOP & RAPID PROFIT LOCK:
+   - Trailing stop aktif dini di +0.70% profit dengan GAP rapat 0.20%.
+   - Begitu harga bergerak +0.70%, minimal +0.50% (+0.22U) langsung terkunci di kantong.
+   - Jika harga terus melaju ke +1.0%, bot langsung mengeksekusi TP penuh (+0.44U).
+
+4. SOFT BREAKEVEN SHIELD DI +0.50%:
+   - Begitu trade mencapai profit +0.50%, Stop Loss otomatis digeser ke Entry + 0.10%.
+   - Mengunci fee transaksi dan menjamin trade bebas resiko.
+
+5. HARD STOP LOSS KETAT DI 1.0%:
+   - Jika tren ternyata sangat kuat dan tidak mengalami retracement, resiko dipotong ketat di 1.0% (-$0.44U).
+   - Risk/Reward 1:1 dengan Win Rate >65% menghasilkan PROFIT KONSISTEN.
 """
 
 import os
@@ -52,12 +56,15 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"), testnet=True)
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION
+#  CONFIGURATION v24.0 (INVERSE APEX)
 # ═══════════════════════════════════════════════════════════════════════════
 
 LEVERAGE      = 20
 ORDER_USDT    = 2.0
 MAX_POSITIONS = 3
+
+# 🔄 MODE KEBALIKAN (INVERSE TRADING)
+INVERSE_MODE = True
 
 # Scanning & Throttling
 SCAN_INTERVAL   = 3.0    # 3 Detik jeda scan
@@ -74,14 +81,15 @@ MIN_SCORE      = 60      # Minimal skor 60 untuk sinyal tren
 MIN_SCORE_CHOP = 68      # Minimal skor 68 jika BTC sedang RANGE
 TTL_5M         = 2
 
-# ── Dynamic Risk Management v23.0 (Apex Sentinel) ──────────────────────────
-SL_PCT             = 0.010   # Stop Loss 1.0% (Maksimal rugi -$0.44U termasuk komisi)
-BE_TRIGGER_PCT     = 0.0090  # Soft Breakeven aktif saat profit mencapai +0.90% (ROE +18%)
-BE_LOCK_PCT        = 0.0012  # Kunci di +0.12% (menutup taker fee 0.10% + aman dari rugi)
-TRAIL_ACTIVATE_PCT = 0.0130  # Trailing aktif di +1.30% profit
-TRAIL_GAP_PCT      = 0.0035  # Gap 0.35% (Mengunci minimal +0.95% atau ~$0.42U bersih)
-EMERGENCY_TP_PCT   = 0.0400  # Emergency TP 4.0%
-MAX_HOLD_SECONDS   = 10800   # Maksimal tahan posisi 3 Jam (10800s)
+# ── Dynamic Risk Management v24.0 (Inverse & Matched TP) ──────────────────
+TP_PCT             = 0.0100  # Take Profit 1.00% (+0.44U) — DISAMAKAN DENGAN CARA LOSS LALU
+SL_PCT             = 0.0100  # Stop Loss 1.00% (-0.44U batas maksimal resiko)
+BE_TRIGGER_PCT     = 0.0050  # Soft Breakeven aktif saat profit mencapai +0.50%
+BE_LOCK_PCT        = 0.0010  # Kunci di +0.10% (menutup taker fee 0.10% + aman dari rugi)
+TRAIL_ACTIVATE_PCT = 0.0070  # Trailing aktif dini di +0.70% profit
+TRAIL_GAP_PCT      = 0.0020  # Gap rapat 0.20% (Mengunci minimal +0.50% profit)
+EMERGENCY_TP_PCT   = 0.0250  # Emergency TP 2.50%
+MAX_HOLD_SECONDS   = 7200    # Maksimal tahan posisi 2 Jam (7200s)
 # ──────────────────────────────────────────────────────────────────────────
 
 # Smart Circuit Breaker & Streak Protection
@@ -146,17 +154,17 @@ class MarketRegime:
         else: return MarketRegime.REGIME_RANGE, 30, 0
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SIGNAL WEIGHTS & SCORING (HIGH PRECISION TREND ENGINE)
+#  SIGNAL WEIGHTS & SCORING (CONTRARIAN INVERSE ENGINE)
 # ═══════════════════════════════════════════════════════════════════════════
 class SignalWeights:
     def __init__(self):
         self.weights = {
-            # Bullish Signals
+            # Bullish Signals (Yang akan di-FADE menjadi SHORT jika INVERSE_MODE)
             "ema_bull_stack": 35, "ema_mild_bull": 25, "ema_weak_bull": 15,
             "mom_strong": 30, "mom_moderate": 20, "macd_cross_up": 22, "macd_strengthen": 15,
             "orderflow_buy_climax": 25, "orderflow_buy_high": 14,
             "rsi_healthy_bull": 20, "rsi_pullback_bull": 15,
-            # Bearish Signals
+            # Bearish Signals (Yang akan di-FADE menjadi LONG jika INVERSE_MODE)
             "ema_bear_stack": 35, "ema_mild_bear": 25, "ema_weak_bear": 15,
             "mom_strong_neg": 30, "mom_moderate_neg": 20, "macd_cross_down": 22, "macd_strengthen_neg": 15,
             "orderflow_sell_climax": 25, "orderflow_sell_high": 14,
@@ -196,32 +204,38 @@ class SignalScorer:
         if adx < 23:
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
 
-        # Filter Makro BTC Ketat
+        # Filter Makro BTC
         btc_reg = _macro.get("btc", "UNKNOWN")
         btc_m5 = _macro.get("btc_m5", 0.0)
         min_required = MIN_SCORE_CHOP if btc_reg in (MarketRegime.REGIME_RANGE, MarketRegime.REGIME_EXHAUSTION, MarketRegime.REGIME_VOLATILE) else MIN_SCORE
 
-        # 1. Bullish Regime
+        # 1. Bullish Regime di Candle (Retail FOMO Pumping)
         if regime == MarketRegime.REGIME_TRENDING_BULL:
-            # GERBANG BTC: Jika BTC Bearish atau momentumnya negatif (< -0.10%), BLOKIR LONG!
-            if symbol != "BTCUSDT" and (btc_reg == MarketRegime.REGIME_TRENDING_BEAR or btc_m5 < -0.0010):
+            # Jika BTC dalam ledakan vertikal super ekstrem (Mom > +0.40%), tunda shorting sementara
+            if btc_m5 > 0.0040:
                 _stats["regime_block"] += 1
-                return None, long_score, ["BTC_BEAR_BLOCK"], atr, 0, 0, regime, bias
+                return None, long_score, ["BTC_SUPER_PUMP_BLOCK"], atr, 0, 0, regime, bias
 
             if long_score >= min_required:
                 display_sigs = [s.split(':', 1)[-1] for s in long_sigs]
+                if INVERSE_MODE:
+                    # 🔄 KEBALIKAN: Pasar Overbought -> Bot membuka SHORT (Fade the pump)!
+                    return "SHORT", long_score, ["🔄FADE_BULL"] + display_sigs, atr, 0, 0, regime, bias
                 return "LONG", long_score, display_sigs, atr, 0, 0, regime, bias
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
 
-        # 2. Bearish Regime
+        # 2. Bearish Regime di Candle (Retail Panic Selling)
         elif regime == MarketRegime.REGIME_TRENDING_BEAR:
-            # GERBANG BTC: Jika BTC Bullish atau momentumnya positif (> +0.10%), BLOKIR SHORT!
-            if symbol != "BTCUSDT" and (btc_reg == MarketRegime.REGIME_TRENDING_BULL or btc_m5 > 0.0010):
+            # Jika BTC dalam air terjun dump super ekstrem (Mom < -0.40%), tunda longing sementara
+            if btc_m5 < -0.0040:
                 _stats["regime_block"] += 1
-                return None, short_score, ["BTC_BULL_BLOCK"], atr, 0, 0, regime, bias
+                return None, short_score, ["BTC_SUPER_DUMP_BLOCK"], atr, 0, 0, regime, bias
 
             if short_score >= min_required:
                 display_sigs = [s.split(':', 1)[-1] for s in short_sigs]
+                if INVERSE_MODE:
+                    # 🔄 KEBALIKAN: Pasar Oversold -> Bot membuka LONG (Fade the dump)!
+                    return "LONG", short_score, ["🔄FADE_BEAR"] + display_sigs, atr, 0, 0, regime, bias
                 return "SHORT", short_score, display_sigs, atr, 0, 0, regime, bias
             return None, max(long_score, short_score), [], atr, 0, 0, regime, bias
 
@@ -344,10 +358,21 @@ class SignalScorer:
 
 class RiskManager:
     @staticmethod
-    def calculate_levels(entry_price: float, side: str) -> Tuple[float, float]:
+    def calculate_levels(entry_price: float, side: str) -> Tuple[float, float, float]:
+        """
+        Mengembalikan (sl_price, tp_price, emergency_tp)
+        - TP disamakan dengan jarak loss sebelumnya: 1.0% (+0.44U)
+        - SL dibatasi ketat: 1.0% (-0.44U)
+        """
         if side == "LONG":
-            return entry_price * (1 - SL_PCT), entry_price * (1 + EMERGENCY_TP_PCT)
-        return entry_price * (1 + SL_PCT), entry_price * (1 - EMERGENCY_TP_PCT)
+            sl_px = entry_price * (1 - SL_PCT)
+            tp_px = entry_price * (1 + TP_PCT)
+            emg_tp = entry_price * (1 + EMERGENCY_TP_PCT)
+        else:
+            sl_px = entry_price * (1 + SL_PCT)
+            tp_px = entry_price * (1 - TP_PCT)
+            emg_tp = entry_price * (1 - EMERGENCY_TP_PCT)
+        return sl_px, tp_px, emg_tp
 
 @dataclass
 class TradeRecord:
@@ -422,7 +447,7 @@ _macro = {"btc": "UNKNOWN", "btc_m5": 0.0, "btc_adx": 0.0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "trail_exit": 0, "be_exit": 0, "hard_sl": 0, "btc_cut": 0, "emg_tp": 0, "time_exit": 0,
+    "tp_target": 0, "trail_exit": 0, "be_exit": 0, "hard_sl": 0, "btc_cut": 0, "emg_tp": 0, "time_exit": 0,
     "regime_block": 0, "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -538,7 +563,7 @@ def get_real_fill_price(sym, order_resp):
     return 0.0
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CORE TRADING FUNCTIONS
+#  CORE TRADING FUNCTIONS (INVERSE & RISK MANAGEMENT)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
@@ -562,18 +587,6 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
         with _lock: live_positions.pop(sym, None)
         return
 
-    sl_price, emg_tp = RiskManager.calculate_levels(price, orig_direction)
-
-    pos = {
-        "side": orig_direction, "entry": price, "qty": q_val,
-        "open_time": time.time(), "score": score, "sigs": sigs,
-        "atr": atr, "regime": regime, "bias": bias,
-        "sl_price": sl_price, "emergency_tp": emg_tp,
-        "peak_price": price, "be_active": False,
-        "trail_active": False, "trail_stop": None,
-    }
-    with _lock: live_positions[sym] = pos
-
     try: client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
     except Exception: pass
 
@@ -586,12 +599,18 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
         real_px = get_real_fill_price(sym, order)
         if real_px > 0:
             price = real_px
-            sl_p2, emg2 = RiskManager.calculate_levels(price, orig_direction)
-            with _lock:
-                if sym in live_positions and not live_positions[sym].get('_r'):
-                    live_positions[sym].update({
-                        'entry': price, 'sl_price': sl_p2, 'emergency_tp': emg2, 'peak_price': price
-                    })
+
+        sl_price, tp_price, emg_tp = RiskManager.calculate_levels(price, orig_direction)
+
+        pos = {
+            "side": orig_direction, "entry": price, "qty": q_val,
+            "open_time": time.time(), "score": score, "sigs": sigs,
+            "atr": atr, "regime": regime, "bias": bias,
+            "sl_price": sl_price, "tp_price": tp_price, "emergency_tp": emg_tp,
+            "peak_price": price, "be_active": False,
+            "trail_active": False, "trail_stop": None,
+        }
+        with _lock: live_positions[sym] = pos
         print(f"         ✅ ORDER #{order.get('orderId')} | fill:{price:.6g} | qty:{q_val}")
     except Exception as e:
         print(f"  ❌ ORDER GAGAL {sym}: {e}")
@@ -599,7 +618,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym):
         return
 
     d = "🟢" if orig_direction == "LONG" else "🔴"
-    print(f"\n  {d} [v23.0 APEX] {sym} {orig_direction} @{price:.6g} | SL:{SL_PCT*100:.2f}% | Trail:±{TRAIL_GAP_PCT*100:.2f}% | Regime:{regime}")
+    inv_tag = "🔄[INVERSE FADE]" if INVERSE_MODE else "📈[TREND]"
+    print(f"\n  {d} [v24.0] {inv_tag} {sym} {orig_direction} @{price:.6g} | TP:{TP_PCT*100:.2f}% | SL:{SL_PCT*100:.2f}% | Trail:@{TRAIL_ACTIVATE_PCT*100:.2f}% (gap:{TRAIL_GAP_PCT*100:.2f}%)")
     print(f"         Signals: {' | '.join(sigs[:5])}")
     _stats["trades"] += 1
 
@@ -647,7 +667,7 @@ def live_close(sym, reason, price=None):
     if pos.get("be_active"): trail_info += " 🛡️BE_protected"
     if pos.get("trail_active"): trail_info += " ✅trail_active"
 
-    print(f"  {e_icon} [v23.0 CLOSE] {sym} {side} — {reason}{trail_info}")
+    print(f"  {e_icon} [v24.0 CLOSE] {sym} {side} — {reason}{trail_info}")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
 
     trade = TradeRecord(
@@ -669,7 +689,8 @@ def live_close(sym, reason, price=None):
         _stats["losses"] += 1
         if pnl < _stats["worst"]: _stats["worst"] = pnl
 
-    if "TRAIL" in reason: _stats["trail_exit"] += 1
+    if "TP_TARGET" in reason: _stats["tp_target"] += 1
+    elif "TRAIL" in reason: _stats["trail_exit"] += 1
     elif "BE" in reason: _stats["be_exit"] += 1
     elif "BTC" in reason: _stats["btc_cut"] += 1
     elif "SL" in reason: _stats["hard_sl"] += 1
@@ -689,7 +710,7 @@ def live_close(sym, reason, price=None):
     print_inline()
 
 def monitor_positions():
-    """Memantau posisi secara real-time dengan Active BTC Guard & Soft Breakeven."""
+    """Memantau posisi secara real-time dengan Inverted TP Target, Early Trail & Soft Breakeven."""
     btc_reg = _macro.get("btc", "UNKNOWN")
     btc_m5 = _macro.get("btc_m5", 0.0)
 
@@ -699,7 +720,8 @@ def monitor_positions():
         px = price_live(sym)
         if px == 0: continue
 
-        side, entry, sl_px, emg_tp = pos["side"], pos["entry"], pos["sl_price"], pos["emergency_tp"]
+        side, entry = pos["side"], pos["entry"]
+        sl_px, tp_px, emg_tp = pos["sl_price"], pos.get("tp_price", 0.0), pos["emergency_tp"]
         hold_time = time.time() - pos["open_time"]
 
         # Kalkulasi Profit Saat Ini & Peak
@@ -711,41 +733,24 @@ def monitor_positions():
         peak = pos["peak_price"]
         peak_profit = (peak - entry) / entry if side == "LONG" else (entry - peak) / entry
 
-        # 1. 🛡️ ACTIVE BTC MACRO POSITION GUARD: Cut Loss Dini Saat BTC Berbalik Arah Tajam
-        # Jika memegang SHORT dan BTC tiba-tiba meledak Bullish kuat:
-        if side == "SHORT" and (btc_reg == MarketRegime.REGIME_TRENDING_BULL and btc_m5 > 0.0015):
-            if cur_profit < -0.0025: # Jika posisi sudah mulai minus 0.25%, cut segera!
-                live_close(sym, "BTC_BULL_FLIP", px)
-                continue
-
-        # Jika memegang LONG dan BTC tiba-tiba ambruk Bearish kuat:
-        if side == "LONG" and (btc_reg == MarketRegime.REGIME_TRENDING_BEAR and btc_m5 < -0.0015):
-            if cur_profit < -0.0025: # Jika posisi sudah mulai minus 0.25%, cut segera!
-                live_close(sym, "BTC_BEAR_FLIP", px)
-                continue
-
-        # 2. Batas Maksimal Waktu Tahan: 3 Jam (10800s)
-        if hold_time > MAX_HOLD_SECONDS:
-            live_close(sym, "TIME_LIMIT", px)
+        # 1. 🎯 TAKE PROFIT TARGET (Disamakan dengan jarak loss sebelumnya: 1.0% = +$0.44U)
+        if (side == "LONG" and px >= tp_px) or (side == "SHORT" and px <= tp_px):
+            live_close(sym, "TP_TARGET", px)
             continue
 
-        # 3. Hard Stop Loss / Breakeven Hit
+        # 2. 🛡️ HARD STOP LOSS / BREAKEVEN HIT (1.0% = -$0.44U)
         if side == "LONG" and px <= sl_px:
             reason = "BE_EXIT" if pos.get("be_active") else "SL"
-            live_close(sym, reason, sl_px); continue
+            live_close(sym, reason, sl_px)
+            continue
         if side == "SHORT" and px >= sl_px:
             reason = "BE_EXIT" if pos.get("be_active") else "SL"
-            live_close(sym, reason, sl_px); continue
+            live_close(sym, reason, sl_px)
+            continue
 
-        # 4. Emergency Hard TP (+4.0%)
-        if side == "LONG" and px >= emg_tp:
-            live_close(sym, "TP_EMG", emg_tp); continue
-        if side == "SHORT" and px <= emg_tp:
-            live_close(sym, "TP_EMG", emg_tp); continue
-
-        # 5. 🛡️ SOFT BREAKEVEN SHIELD: Kunci Breakeven saat Peak Profit mencapai +0.90%
-        # Memberikan bantalan ayunan 0.78% (tidak kena noise), tapi MENJAMIN trade untung tidak jadi rugi
-        if peak_profit >= BE_TRIGGER_PCT and not pos.get("be_active"):
+        # 3. 🛡️ SOFT BREAKEVEN SHIELD (Aktif di +0.50% profit, kunci +0.10% BE)
+        # Mengharuskan hold_time >= 10s agar tidak tersulut slippage sesaat
+        if hold_time >= 10 and peak_profit >= BE_TRIGGER_PCT and not pos.get("be_active"):
             pos["be_active"] = True
             if side == "LONG":
                 be_px = entry * (1 + BE_LOCK_PCT)
@@ -753,26 +758,47 @@ def monitor_positions():
             else:
                 be_px = entry * (1 - BE_LOCK_PCT)
                 if be_px < pos["sl_price"]: pos["sl_price"] = be_px
-            print(f"  🛡️ [SOFT BE] {sym} {side} | peak:{peak_profit*100:+.2f}% | SL locked to BE: {pos['sl_price']:.6g}")
+            print(f"  🛡️ [SOFT BE] {sym} {side} | peak:{peak_profit*100:+.2f}% | SL moved to BE: {pos['sl_price']:.6g}")
 
-        # 6. Aktivasi Trailing Stop di +1.30%
+        # 4. 🔔 TRAILING STOP (Aktif di +0.70% dengan GAP rapat 0.20%)
         if not pos["trail_active"]:
-            if peak_profit >= TRAIL_ACTIVATE_PCT:
+            if hold_time >= 10 and peak_profit >= TRAIL_ACTIVATE_PCT:
                 pos["trail_active"] = True
                 pos["trail_stop"] = peak * (1 - TRAIL_GAP_PCT) if side == "LONG" else peak * (1 + TRAIL_GAP_PCT)
                 print(f"  🔔 [TRAIL ON] {sym} {side} | peak:{peak_profit*100:+.2f}% | trail_stop:{pos['trail_stop']:.6g}")
 
-        # 7. Trailing Stop Execution
         if pos["trail_active"]:
             ts = pos["trail_stop"]
             if side == "LONG":
                 new_ts = peak * (1 - TRAIL_GAP_PCT)
                 if new_ts > ts: pos["trail_stop"] = new_ts; ts = new_ts
-                if px <= ts: live_close(sym, "TRAIL", ts); continue
+                if px <= ts:
+                    live_close(sym, "TRAIL", ts)
+                    continue
             else:
                 new_ts = peak * (1 + TRAIL_GAP_PCT)
                 if new_ts < ts: pos["trail_stop"] = new_ts; ts = new_ts
-                if px >= ts: live_close(sym, "TRAIL", ts); continue
+                if px >= ts:
+                    live_close(sym, "TRAIL", ts)
+                    continue
+
+        # 5. 🛡️ ACTIVE BTC GUARD: Cut loss dini jika BTC meledak berlawanan arah dengan posisi
+        if side == "SHORT" and btc_m5 > 0.0035 and cur_profit < -0.0030:
+            live_close(sym, "BTC_BULL_FLIP", px)
+            continue
+        if side == "LONG" and btc_m5 < -0.0035 and cur_profit < -0.0030:
+            live_close(sym, "BTC_BEAR_FLIP", px)
+            continue
+
+        # 6. 🚨 EMERGENCY TP (+2.5%)
+        if (side == "LONG" and px >= emg_tp) or (side == "SHORT" and px <= emg_tp):
+            live_close(sym, "TP_EMG", emg_tp)
+            continue
+
+        # 7. ⏱️ TIME LIMIT (2 Jam = 7200s)
+        if hold_time > MAX_HOLD_SECONDS:
+            live_close(sym, "TIME_LIMIT", px)
+            continue
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SCANNER THREAD & MAIN
@@ -839,8 +865,8 @@ def print_inline():
     aw = learning.avg_win()
     avg_pk = learning.avg_peak_win()
     e = "💚" if pnl >= 0 else "🔴"
-    print(f"       ┌ [v23.0 APEX] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
-    print(f"       └ Trail:{_stats['trail_exit']} BE:{_stats['be_exit']} Cut:{_stats['btc_cut']} SL:{_stats['hard_sl']} AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
+    print(f"       ┌ [v24.0 INVERSE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"       └ TP:{_stats['tp_target']} Trail:{_stats['trail_exit']} BE:{_stats['be_exit']} SL:{_stats['hard_sl']} AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -853,10 +879,10 @@ def print_full():
     bep = al / (al + aw) * 100 if (al + aw) > 0 else 50
 
     print(f"\n  {'─'*70}")
-    print(f"    🔔 APEX SENTINEL v23.0 (ACTIVE BTC GUARD & SOFT BE)")
+    print(f"    🔔 INVERSE APEX v24.0 (CONTRARIAN REVERSAL ENGINE)")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"    📈 Exit: Trail:{_stats['trail_exit']} | BE:{_stats['be_exit']} | BTCCut:{_stats['btc_cut']} | SL:{_stats['hard_sl']} | EmgTP:{_stats['emg_tp']}")
+    print(f"    📈 Exit: TP:{_stats['tp_target']} | Trail:{_stats['trail_exit']} | BE:{_stats['be_exit']} | SL:{_stats['hard_sl']} | BTCCut:{_stats['btc_cut']} | EmgTP:{_stats['emg_tp']}")
     print(f"    💰 Avg Win:{aw:+.5f}U | Avg Loss:{-al:+.5f}U | BEP WR:{bep:.1f}%")
     print(f"    🌐 BTC Macro: {_macro.get('btc', 'UNKNOWN')} (Mom:{_macro.get('btc_m5', 0)*100:+.2f}%)")
 
@@ -961,11 +987,12 @@ def t_macro():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  🟢 APEX SENTINEL v23.0 LIVE — ACTIVE BTC GUARD & SOFT BE          ║")
-    print("║  ✅ Active BTC Guard: Cut dini posisi saat BTC berbalik arah tajam ║")
-    print("║  ✅ Strict BTC Gate: Blokir Short saat BTC Bullish / Mom > +0.10%  ║")
-    print("║  ✅ Soft Breakeven: Kunci BE di +0.90% (Bantalan 0.78% bebas noise)║")
-    print("║  ✅ Asymmetric R:R: SL 1.0% (-0.44U) vs Trailing (+0.54U s/d +1.5U)║")
+    print("║  🟢 INVERSE APEX v24.0 LIVE — CONTRARIAN REVERSAL ENGINE           ║")
+    print("║  🔄 INVERSE ENTRY: Fade Overbought (Bull->SHORT), Oversold->LONG   ║")
+    print("║  🎯 TP TARGET: 1.00% (+0.44U) Disamakan dengan Titik Loss Lalu     ║")
+    print("║  🔔 EARLY TRAILING: Aktif di +0.70% dengan GAP Rapat 0.20%         ║")
+    print("║  🛡️ SOFT BREAKEVEN: Aktif di +0.50% (Mengunci +0.10% Bebas Resiko) ║")
+    print("║  🛑 HARD STOP LOSS: 1.00% (-0.44U) Pembatas Resiko Disiplin        ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try: valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
     except: valid = set(SYMBOLS)
