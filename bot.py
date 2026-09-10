@@ -26,7 +26,7 @@ import ta
 
 load_dotenv()
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
-# client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # 🔧 v21: WebSocket manager — dipakai untuk mark price & kline streams supaya
 # tidak lagi polling REST tiap 0.1-2 detik (itu penyebab rate-limit ban).
