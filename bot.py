@@ -26,7 +26,7 @@ import ta
 
 load_dotenv()
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
-client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+# client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # 🔧 v21: WebSocket manager — dipakai untuk mark price & kline streams supaya
 # tidak lagi polling REST tiap 0.1-2 detik (itu penyebab rate-limit ban).
@@ -963,15 +963,18 @@ def t_macro():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def handle_all_ticker(msg):
-    """!ticker@arr — 24hr ticker (priceChangePercent, quoteVolume, lastPrice) semua
-    simbol, dorongan tiap ~1 detik. Ini pengganti tickers_all() versi REST yang
-    kemarin memicu IP ban (dipanggil tiap 2 detik dengan bobot ~40/call)."""
+    """Stream `!ticker@arr` (24hr ticker: priceChangePercent, quoteVolume, lastPrice)
+    untuk semua simbol, dorongan tiap ~1 detik. Disubscribe lewat multiplex socket
+    generik karena wrapper start_all_ticker_futures_socket() di library ini defaultnya
+    salah subscribe ke !bookTicker (tidak ada param untuk override channel)."""
     global _ws_last_msg_ts, _ws_ticker_cache, _ws_ticker_ts
     try:
         _ws_last_msg_ts = time.time()
-        arr = msg if isinstance(msg, list) else [msg]
+        data = msg.get("data", msg) if isinstance(msg, dict) else msg  # unwrap combined-stream envelope kalau ada
+        arr = data if isinstance(data, list) else [data]
         cache = {}
         for d in arr:
+            if not isinstance(d, dict): continue
             sym = d.get("s")
             if not sym: continue
             try:
@@ -1066,7 +1069,10 @@ def run_bot():
     # ── 2) Nyalakan WebSocket: mark price (semua simbol) + kline (simbol yg dipantau) + user data
     twm.start()
     twm.start_all_mark_price_socket(callback=handle_mark_price, fast=True)
-    twm.start_all_ticker_futures_socket(callback=handle_all_ticker)
+    # 🔧 FIX: start_all_ticker_futures_socket() bawaan library defaultnya subscribe
+    # ke !bookTicker (salah), dan tidak punya param channel untuk diganti. Subscribe
+    # manual ke !ticker@arr lewat multiplex socket generik supaya datanya benar.
+    twm.start_futures_multiplex_socket(callback=handle_all_ticker, streams=["!ticker@arr"])
     kline_streams = [f"{s.lower()}@kline_5m" for s in syms]
     twm.start_futures_multiplex_socket(callback=handle_kline_multiplex, streams=kline_streams)
     try:
