@@ -83,6 +83,10 @@ MIN_SCORE      = 55
 SLIPPAGE_GUARD = 0.0015
 TTL_5M         = 2
 
+# ── Strategy Execution Mode (Inverse / Contrarian vs Direct) ──────────────
+INVERT_SIGNALS = True   # True: Balik arah entry (Analisis LONG -> Entri SHORT, Analisis SHORT -> Entri LONG)
+
+
 # ── Dynamic Volatility Risk Management (ATR Trailing) ─────────────────────
 ATR_SL_MULTIPLIER        = 1.8   # SL = 1.8x ATR
 ATR_TRAIL_ACT_MULTIPLIER = 1.6   # Trail aktif setelah profit >= 1.6x ATR
@@ -498,28 +502,64 @@ class SignalScorer:
             long_score -= 20
 
         # Regime Gating + Institutional Absorption Mean-Reversion Exception
+        raw_direction = None
+        target_score = 0
+        target_sigs = []
+
         if regime == MarketRegime.REGIME_TRENDING_BULL:
-            if long_score >= MIN_SCORE: return "LONG", long_score, long_sigs, atr, regime, bias
-            return None, max(long_score, short_score), [], atr, regime, bias
+            if long_score >= MIN_SCORE:
+                raw_direction = "LONG"
+                target_score = long_score
+                target_sigs = long_sigs
+            else:
+                return None, max(long_score, short_score), [], atr, regime, bias
 
         elif regime == MarketRegime.REGIME_TRENDING_BEAR:
-            if short_score >= MIN_SCORE: return "SHORT", short_score, short_sigs, atr, regime, bias
-            return None, max(long_score, short_score), [], atr, regime, bias
+            if short_score >= MIN_SCORE:
+                raw_direction = "SHORT"
+                target_score = short_score
+                target_sigs = short_sigs
+            else:
+                return None, max(long_score, short_score), [], atr, regime, bias
 
         elif regime in (MarketRegime.REGIME_RANGE, MarketRegime.REGIME_EXHAUSTION):
             # Institutional Exception: Absorption at range boundaries is a prime institutional setup!
             if bull_absorb and long_score >= MIN_SCORE:
-                return "LONG", long_score, long_sigs, atr, f"{regime}_ABSORB", bias
-            if bear_absorb and short_score >= MIN_SCORE:
-                return "SHORT", short_score, short_sigs, atr, f"{regime}_ABSORB", bias
-            _stats["regime_block"] += 1
-            return None, max(long_score, short_score), [], atr, regime, bias
+                raw_direction = "LONG"
+                target_score = long_score
+                target_sigs = long_sigs
+                regime = f"{regime}_ABSORB"
+            elif bear_absorb and short_score >= MIN_SCORE:
+                raw_direction = "SHORT"
+                target_score = short_score
+                target_sigs = short_sigs
+                regime = f"{regime}_ABSORB"
+            else:
+                _stats["regime_block"] += 1
+                return None, max(long_score, short_score), [], atr, regime, bias
 
         elif regime == MarketRegime.REGIME_VOLATILE:
             _stats["regime_block"] += 1
             return None, max(long_score, short_score), [], atr, regime, bias
 
-        return None, 0, [], atr, regime, bias
+        if raw_direction is None:
+            return None, 0, [], atr, regime, bias
+
+        # ── Inversion Logic (Contrarian / Reverse Execution) ───────────────
+        if INVERT_SIGNALS:
+            if raw_direction == "LONG":
+                final_direction = "SHORT"
+                final_sigs = ["🔄INV_SHORT(Analyst:LONG)"] + target_sigs
+            else:
+                final_direction = "LONG"
+                final_sigs = ["🔄INV_LONG(Analyst:SHORT)"] + target_sigs
+            final_bias = -bias
+        else:
+            final_direction = raw_direction
+            final_sigs = target_sigs
+            final_bias = bias
+
+        return final_direction, target_score, final_sigs, atr, regime, final_bias
 
     def _score_long(self, df: pd.DataFrame, symbol: str) -> Tuple[int, List[str]]:
         row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
@@ -975,7 +1015,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
 
     d = "🟢" if orig_direction == "LONG" else "🔴"
     imb_str = f" | BAI:{order_book.get_imbalance(sym)*100:+.0f}%" if order_book.get_book(sym) else ""
-    print(f"\n  {d} [INSTITUTIONAL v22] {sym} {orig_direction} @{price:.6g} | SL:{sl_pct*100:.2f}% (1.8x ATR) | Trail:±{trail_gap_pct*100:.2f}% (Act:{trail_act_pct*100:.2f}%){imb_str} | Regime:{regime}")
+    tag = "[INSTITUTIONAL v22 INVERTED]" if INVERT_SIGNALS else "[INSTITUTIONAL v22]"
+    print(f"\n  {d} {tag} {sym} {orig_direction} @{price:.6g} | SL:{sl_pct*100:.2f}% (1.8x ATR) | Trail:±{trail_gap_pct*100:.2f}% (Act:{trail_act_pct*100:.2f}%){imb_str} | Regime:{regime}")
     print(f"         Signals: {' | '.join(sigs[:6])}")
     _stats["trades"] += 1
     if any("Absorb" in s for s in sigs):
@@ -1025,7 +1066,8 @@ def live_close(sym, reason, price=None):
     trail_info = f" | peak:{peak_pct*100:+.3f}%"
     if pos.get("trail_active"): trail_info += " ✅trail_was_active"
 
-    print(f"  {e_icon} [INSTITUTIONAL v22] {sym} {side} CLOSE — {reason}{trail_info}")
+    tag = "[INSTITUTIONAL v22 INVERTED]" if INVERT_SIGNALS else "[INSTITUTIONAL v22]"
+    print(f"  {e_icon} {tag} {sym} {side} CLOSE — {reason}{trail_info}")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
 
     trade = TradeRecord(
@@ -1200,7 +1242,8 @@ def print_inline():
     aw = learning.avg_win()
     avg_pk = learning.avg_peak_win()
     e = "💚" if pnl >= 0 else "🔴"
-    print(f"       ┌ [INSTITUTIONAL v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    tag = "[INSTITUTIONAL v22 INVERTED]" if INVERT_SIGNALS else "[INSTITUTIONAL v22]"
+    print(f"       ┌ {tag} {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"       └ Trail:{_stats['trail_exit']} SL:{_stats['hard_sl']} Absorb:{_stats['absorb_entries']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
 
 def print_full():
@@ -1214,8 +1257,9 @@ def print_full():
     bep = al / (al + aw) * 100 if (al + aw) > 0 else 50
     avg_pk_win = learning.avg_peak_win()
 
+    sub_title = " (INVERSE / CONTRARIAN MODE)" if INVERT_SIGNALS else ""
     print(f"\n  {'─'*72}")
-    print(f"    🔔 INSTITUTIONAL SCALPING v22 LIVE DASHBOARD")
+    print(f"    🔔 INSTITUTIONAL SCALPING v22 LIVE DASHBOARD{sub_title}")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    📈 Exit: Trail:{_stats['trail_exit']} | SL:{_stats['hard_sl']} | EmgTP:{_stats['emg_tp']}")
@@ -1305,6 +1349,8 @@ def t_macro():
                 _btc_macro["m5"] = row.get("m5", 0.0)
                 _btc_macro["delta_ratio"] = row.get("delta_ratio", 0.0)
                 _btc_macro["cvd"] = row.get("cvd", 0.0)
+                if btc_macro.last_price == 0.0 and len(df_btc) > 0:
+                    btc_macro.update_tick(float(df_btc.iloc[-1]["close"]))
         except Exception as e:
             _log_err("t_macro", e)
         time.sleep(10)
@@ -1344,7 +1390,10 @@ def handle_mark_price(msg):
             sym, px = d.get("s"), d.get("p")
             if sym and px:
                 pf = float(px)
-                if pf > 0: _ws_mark_price[sym] = (pf, now)
+                if pf > 0:
+                    _ws_mark_price[sym] = (pf, now)
+                    if sym == "BTCUSDT" and btc_macro.last_price == 0.0:
+                        btc_macro.update_tick(pf, now)
     except Exception as e:
         _log_err("handle_mark_price", e)
 
@@ -1428,7 +1477,11 @@ def t_ws_watchdog():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  💎 BOT SCALPING v22.0 LIVE — INSTITUTIONAL QUANT ENGINE (Binance)   ║")
+    if INVERT_SIGNALS:
+        print("║  🔄 BOT SCALPING v22.0 LIVE — INVERSE / CONTRARIAN QUANT ENGINE    ║")
+        print("║  ★ INVERT MODE ACTIVE: Analysis LONG -> SHORT | SHORT -> LONG      ║")
+    else:
+        print("║  💎 BOT SCALPING v22.0 LIVE — INSTITUTIONAL QUANT ENGINE (Binance)   ║")
     print("║  1. Microstructure: @depth10, Bid-Ask Imbalance, Sell/Buy Wall Veto ║")
     print("║  2. Macro Tick: BTC Flash Crash/Pump Breaker (aggTrade, 120s Veto) ║")
     print("║  3. Order Flow: Volume Delta, CVD & Institutional Absorption        ║")
