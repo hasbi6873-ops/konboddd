@@ -1,25 +1,13 @@
 """
 Bot Scalping v22.0 LIVE — INSTITUTIONAL QUANT ENGINE (Binance Futures)
 ====================================================================
-ARSITEKTUR STRATEGI INSTITUSIONAL (4 PILAR UTAMA):
-1. REAL-TIME ORDER BOOK & MARKET DEPTH (@depth10):
-   - Bid-Ask Imbalance (BAI) real-time queue pressure.
-   - Institutional Wall Detection (Sell Wall / Buy Wall >= 2.5x avg atau >= 35% depth) dalam radius 0.5% dengan HARD VETO.
-   - Spoofing & Liquidity Pulling Detector (penarikan >40% likuiditas mendadak).
-2. MACRO FILTERING & TICK-BY-TICK BTC CORRELATION:
-   - Websocket btcusdt@aggTrade stream tick-by-tick real-time.
-   - BTC Flash Crash / Flash Pump Circuit Breaker (lonjakan/kejatuhan > 0.3% dalam window 8s).
-   - VETO otomatis sinyal Altcoin counter-trend selama 120 detik.
-   - BTC Macro Trend & Dominance Alignment.
-3. ADVANCED ORDER FLOW & VOLUME DELTA + ABSORPTION:
-   - Institutional Volume Delta (Taker Buy vs Taker Sell) & Cumulative Volume Delta (CVD).
-   - Institutional Absorption Detector: Penyerapan pasif limit buyer/seller saat volume meledak pada support/resistance.
-4. VOLATILITY-ADJUSTED RISK MANAGEMENT (DYNAMIC ATR TRAILING):
-   - Stop Loss, Trailing Activation, Trailing Gap, dan Emergency TP dinamis proporsional terhadap ATR real-time.
-   - Mengadaptasi volatilitas setiap koin secara individual (pelebaran gap pada koin liar, pengetatan pada koin stabil).
-5. PERBAIKAN LOGIKA SCORING & ABSOLUTE PNL SYNC:
-   - Koreksi pembalikan logika long vs short pada kode lama.
-   - Eksekusi fill price mutlak dari (cumQuote / executedQty).
+MODIFIKASI EKSPERIMEN: REVERSE TRADING & SWAPPED TP/SL (NO TRAILING STOP)
+- Signal Asli LONG  -> Eksekusi SHORT
+- Signal Asli SHORT -> Eksekusi LONG
+- Jarak TP Baru = Jarak SL Lama (1.8x ATR)
+- Jarak SL Baru = Jarak TP Lama (Emergency TP 3.5x ATR)
+- Trailing Stop Dihapus Sepenuhnya
+- Penambahan Tracking ATH PnL (Highest Peak Cumulative PnL) pada Dashboard
 """
 
 import sys
@@ -83,24 +71,17 @@ MIN_SCORE      = 55
 SLIPPAGE_GUARD = 0.0015
 TTL_5M         = 2
 
-# ── Strategy Execution Mode (Inverse / Contrarian vs Direct) ──────────────
-INVERT_SIGNALS = True   # True: Balik arah entry (Analisis LONG -> Entri SHORT, Analisis SHORT -> Entri LONG)
+# ── Dynamic Volatility Risk Management (ATR Multipliers) ───────────────────
+# REVERSED TP/SL:
+# SL Lama (1.8x ATR) dijadikan TP Baru
+# TP Lama (3.5x ATR) dijadikan SL Baru
+ATR_SL_OLD_AS_TP_NEW_MULTIPLIER = 1.8   # TP Baru = 1.8x ATR (dulu SL)
+ATR_TP_OLD_AS_SL_NEW_MULTIPLIER = 3.5   # SL Baru = 3.5x ATR (dulu TP)
 
-
-# ── Dynamic Volatility Risk Management (ATR Trailing) ─────────────────────
-ATR_SL_MULTIPLIER        = 1.8   # SL = 1.8x ATR
-ATR_TRAIL_ACT_MULTIPLIER = 1.6   # Trail aktif setelah profit >= 1.6x ATR
-ATR_TRAIL_GAP_MULTIPLIER = 0.8   # Trail gap mundur = 0.8x ATR
-ATR_EMG_TP_MULTIPLIER    = 3.5   # Emergency TP = 3.5x ATR
-
-MIN_SL_PCT        = 0.008  # 0.8% minimum SL
-MAX_SL_PCT        = 0.035  # 3.5% maximum SL
-MIN_TRAIL_ACT_PCT = 0.010  # 1.0% minimum Trail Activation
-MAX_TRAIL_ACT_PCT = 0.040  # 4.0% maximum Trail Activation
-MIN_TRAIL_GAP_PCT = 0.004  # 0.4% minimum Trail Gap
-MAX_TRAIL_GAP_PCT = 0.015  # 1.5% maximum Trail Gap
-MIN_EMG_TP_PCT    = 0.025  # 2.5% minimum Emergency TP
-MAX_EMG_TP_PCT    = 0.080  # 8.0% maximum Emergency TP
+MIN_TP_PCT        = 0.008  # 0.8% minimum TP
+MAX_TP_PCT        = 0.035  # 3.5% maximum TP
+MIN_SL_PCT        = 0.025  # 2.5% minimum SL
+MAX_SL_PCT        = 0.080  # 8.0% maximum SL
 MAX_HOLD_SECONDS  = 10800  # 3 Jam batas maksimal tahan posisi
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -344,13 +325,13 @@ class AbsorptionDetector:
         lw_ratio = row.get("lower_wick_ratio", 0.0)
         uw_ratio = row.get("upper_wick_ratio", 0.0)
 
-        # Bullish Absorption: Market seller panik menjual, tapi limit order institusi menyerap
+        # Bullish Absorption
         heavy_seller = (delta_ratio < -0.20) or (buy_ratio < 0.40)
         wick_bull = lw_ratio >= 0.38
         close_held_bull = close >= (low + 0.45 * rng)
         bull_absorb = vol_spike and heavy_seller and (wick_bull or close_held_bull)
 
-        # Bearish Absorption: Market buyer FOMO membeli, tapi limit order institusi menahan
+        # Bearish Absorption
         heavy_buyer = (delta_ratio > 0.20) or (buy_ratio > 0.60)
         wick_bear = uw_ratio >= 0.38
         close_held_bear = close <= (high - 0.45 * rng)
@@ -365,33 +346,33 @@ class AbsorptionDetector:
         return bull_absorb, bear_absorb, " ".join(details)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  4. VOLATILITY-ADJUSTED RISK MANAGEMENT (DYNAMIC ATR TRAILING)
+#  4. VOLATILITY-ADJUSTED RISK MANAGEMENT (REVERSED TP/SL, NO TRAILING)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class DynamicRiskManager:
     @staticmethod
-    def calculate_levels(entry_price: float, side: str, atr: float) -> Dict[str, float]:
+    def calculate_levels(entry_price: float, execution_side: str, atr: float) -> Dict[str, float]:
+        # REVERSED TP/SL:
+        # Menggunakan jarak execution_side aktual
         atr_pct = (atr / entry_price) if entry_price > 0 else 0.015
         
-        sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_MULTIPLIER * atr_pct))
-        trail_act_pct = max(MIN_TRAIL_ACT_PCT, min(MAX_TRAIL_ACT_PCT, ATR_TRAIL_ACT_MULTIPLIER * atr_pct))
-        trail_gap_pct = max(MIN_TRAIL_GAP_PCT, min(MAX_TRAIL_GAP_PCT, ATR_TRAIL_GAP_MULTIPLIER * atr_pct))
-        emg_tp_pct = max(MIN_EMG_TP_PCT, min(MAX_EMG_TP_PCT, ATR_EMG_TP_MULTIPLIER * atr_pct))
+        # Jarak TP baru diambil dari perkalian SL lama (1.8x ATR)
+        tp_pct = max(MIN_TP_PCT, min(MAX_TP_PCT, ATR_SL_OLD_AS_TP_NEW_MULTIPLIER * atr_pct))
+        # Jarak SL baru diambil dari perkalian TP lama (3.5x ATR)
+        sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_TP_OLD_AS_SL_NEW_MULTIPLIER * atr_pct))
 
-        if side == "LONG":
+        if execution_side == "LONG":
+            tp_price = entry_price * (1 + tp_pct)
             sl_price = entry_price * (1 - sl_pct)
-            emg_tp   = entry_price * (1 + emg_tp_pct)
-        else:
+        else: # SHORT
+            tp_price = entry_price * (1 - tp_pct)
             sl_price = entry_price * (1 + sl_pct)
-            emg_tp   = entry_price * (1 - emg_tp_pct)
 
         return {
+            "tp_pct": tp_pct,
             "sl_pct": sl_pct,
-            "trail_act_pct": trail_act_pct,
-            "trail_gap_pct": trail_gap_pct,
-            "emg_tp_pct": emg_tp_pct,
+            "tp_price": tp_price,
             "sl_price": sl_price,
-            "emg_tp_price": emg_tp,
             "atr_pct": atr_pct
         }
 
@@ -420,7 +401,7 @@ class MarketRegime:
         mild_bear  = close < e9 < e21
         strong_trend      = adx > 25
         very_strong_trend = adx > 35
-        atr_expand  = (atr / atr_prev) > 1.2 if atr_prev > 0 else False
+        atr_expand   = (atr / atr_prev) > 1.2 if atr_prev > 0 else False
         atr_collapse = (atr / atr_prev) < 0.8 if atr_prev > 0 else False
         m5, m5_prev = row["m5"], prev["m5"]
         decelerating = (abs(m5) < abs(m5_prev)) if not np.isnan(m5_prev) else False
@@ -440,7 +421,6 @@ class MarketRegime:
 class SignalWeights:
     def __init__(self):
         self.weights = {
-            # Bullish Signals
             "ema_bull_stack": 30, "ema_mild_bull": 20, "ema_weak_bull": 12,
             "mom_strong": 25, "mom_moderate": 15,
             "macd_cross_up": 22, "macd_strengthen": 15,
@@ -448,7 +428,6 @@ class SignalWeights:
             "absorption_bull": 35, "orderbook_imbalance_bull": 20,
             "rsi_bull_flow": 15, "rsi_extreme_ob": 10,
             
-            # Bearish Signals
             "ema_bear_stack": 30, "ema_mild_bear": 20, "ema_weak_bear": 12,
             "mom_strong_neg": 25, "mom_moderate_neg": 15,
             "macd_cross_down": 22, "macd_strengthen_neg": 15,
@@ -479,9 +458,6 @@ class SignalScorer:
         self.weights = signal_weights
 
     def get_signal(self, df: pd.DataFrame, symbol: str = None) -> Tuple[Optional[str], int, List[str], float, str, float]:
-        """
-        Returns: (direction, score, signals, atr, regime, bias)
-        """
         if df is None or len(df) < 55:
             return None, 0, [], 0.0, "UNKNOWN", 0.0
         
@@ -492,7 +468,6 @@ class SignalScorer:
 
         bull_absorb, bear_absorb, _ = AbsorptionDetector.detect(df)
 
-        # Macro BTC Trend Bias Penalty / Bonus
         btc_reg = _btc_macro.get("regime", "UNKNOWN")
         if btc_reg == MarketRegime.REGIME_TRENDING_BULL:
             long_score += 10; long_sigs.append("BTC_BullTrend[+10]")
@@ -501,102 +476,57 @@ class SignalScorer:
             short_score += 10; short_sigs.append("BTC_BearTrend[+10]")
             long_score -= 20
 
-        # Regime Gating + Institutional Absorption Mean-Reversion Exception
-        raw_direction = None
-        target_score = 0
-        target_sigs = []
-
         if regime == MarketRegime.REGIME_TRENDING_BULL:
-            if long_score >= MIN_SCORE:
-                raw_direction = "LONG"
-                target_score = long_score
-                target_sigs = long_sigs
-            else:
-                return None, max(long_score, short_score), [], atr, regime, bias
+            if long_score >= MIN_SCORE: return "LONG", long_score, long_sigs, atr, regime, bias
+            return None, max(long_score, short_score), [], atr, regime, bias
 
         elif regime == MarketRegime.REGIME_TRENDING_BEAR:
-            if short_score >= MIN_SCORE:
-                raw_direction = "SHORT"
-                target_score = short_score
-                target_sigs = short_sigs
-            else:
-                return None, max(long_score, short_score), [], atr, regime, bias
+            if short_score >= MIN_SCORE: return "SHORT", short_score, short_sigs, atr, regime, bias
+            return None, max(long_score, short_score), [], atr, regime, bias
 
         elif regime in (MarketRegime.REGIME_RANGE, MarketRegime.REGIME_EXHAUSTION):
-            # Institutional Exception: Absorption at range boundaries is a prime institutional setup!
             if bull_absorb and long_score >= MIN_SCORE:
-                raw_direction = "LONG"
-                target_score = long_score
-                target_sigs = long_sigs
-                regime = f"{regime}_ABSORB"
-            elif bear_absorb and short_score >= MIN_SCORE:
-                raw_direction = "SHORT"
-                target_score = short_score
-                target_sigs = short_sigs
-                regime = f"{regime}_ABSORB"
-            else:
-                _stats["regime_block"] += 1
-                return None, max(long_score, short_score), [], atr, regime, bias
+                return "LONG", long_score, long_sigs, atr, f"{regime}_ABSORB", bias
+            if bear_absorb and short_score >= MIN_SCORE:
+                return "SHORT", short_score, short_sigs, atr, f"{regime}_ABSORB", bias
+            _stats["regime_block"] += 1
+            return None, max(long_score, short_score), [], atr, regime, bias
 
         elif regime == MarketRegime.REGIME_VOLATILE:
             _stats["regime_block"] += 1
             return None, max(long_score, short_score), [], atr, regime, bias
 
-        if raw_direction is None:
-            return None, 0, [], atr, regime, bias
-
-        # ── Inversion Logic (Contrarian / Reverse Execution) ───────────────
-        if INVERT_SIGNALS:
-            if raw_direction == "LONG":
-                final_direction = "SHORT"
-                final_sigs = ["🔄INV_SHORT(Analyst:LONG)"] + target_sigs
-            else:
-                final_direction = "LONG"
-                final_sigs = ["🔄INV_LONG(Analyst:SHORT)"] + target_sigs
-            final_bias = -bias
-        else:
-            final_direction = raw_direction
-            final_sigs = target_sigs
-            final_bias = bias
-
-        return final_direction, target_score, final_sigs, atr, regime, final_bias
+        return None, 0, [], atr, regime, bias
 
     def _score_long(self, df: pd.DataFrame, symbol: str) -> Tuple[int, List[str]]:
         row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
         score, signals = 0, []
         p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
 
-        # 1. EMA Bullish Trend
         if p > e5 > e9 > e21 > e50: w = self.weights.get_adjusted_weight("ema_bull_stack"); score += w; signals.append(f"EMA5↑[{w:.0f}]")
         elif p > e5 > e9 > e21: w = self.weights.get_adjusted_weight("ema_mild_bull"); score += w; signals.append(f"EMA4↑[{w:.0f}]")
         elif p > e5 > e9: w = self.weights.get_adjusted_weight("ema_weak_bull"); score += w; signals.append(f"EMA3↑[{w:.0f}]")
 
-        # 2. Momentum
         if row["m5"] > 0.003: w = self.weights.get_adjusted_weight("mom_strong"); score += w; signals.append(f"Mom+{row['m5']*100:.1f}%↑[{w:.0f}]")
         elif row["m5"] > 0.0015: w = self.weights.get_adjusted_weight("mom_moderate"); score += w; signals.append(f"Mom+{row['m5']*100:.1f}%↑[{w:.0f}]")
 
-        # 3. MACD
         if prev["mh"] <= 0 and row["mh"] > 0: w = self.weights.get_adjusted_weight("macd_cross_up"); score += w; signals.append(f"MACD_X↑[{w:.0f}]")
         elif row["mh"] > 0 and row["mh"] > prev["mh"] > prev2["mh"]: w = self.weights.get_adjusted_weight("macd_strengthen"); score += w; signals.append(f"MACD↑↑[{w:.0f}]")
 
-        # 4. Order Flow Delta & Aggression
         delta_ratio = row.get("delta_ratio", 0.0)
         buy_ratio = row.get("br", 0.5)
         if delta_ratio > 0.20: w = self.weights.get_adjusted_weight("orderflow_delta_bull"); score += w; signals.append(f"ΔBuy+{delta_ratio*100:.0f}%[{w:.0f}]")
         elif buy_ratio > 0.55: w = self.weights.get_adjusted_weight("orderflow_buy_high"); score += w; signals.append(f"TakerBuy{buy_ratio*100:.0f}%[{w:.0f}]")
 
-        # 5. Bullish Absorption
         bull_abs, _, _ = AbsorptionDetector.detect(df)
         if bull_abs:
             w = self.weights.get_adjusted_weight("absorption_bull"); score += w; signals.append(f"BullAbsorb[{w:.0f}]")
 
-        # 6. Microstructure Order Book Imbalance
         if symbol:
             imb = order_book.get_imbalance(symbol)
             if imb > IMBALANCE_STRONG_BULL:
                 w = self.weights.get_adjusted_weight("orderbook_imbalance_bull"); score += w; signals.append(f"BAI+{imb*100:.0f}%[{w:.0f}]")
 
-        # 7. RSI
         if 48 <= row["rsi"] <= 68: w = self.weights.get_adjusted_weight("rsi_bull_flow"); score += w; signals.append(f"RSI{row['rsi']:.0f}[{w:.0f}]")
         elif row["rsi"] > 68: w = self.weights.get_adjusted_weight("rsi_extreme_ob"); score += w; signals.append(f"RSI{row['rsi']:.0f}OB[{w:.0f}]")
 
@@ -607,37 +537,30 @@ class SignalScorer:
         score, signals = 0, []
         p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
 
-        # 1. EMA Bearish Trend
         if p < e5 < e9 < e21 < e50: w = self.weights.get_adjusted_weight("ema_bear_stack"); score += w; signals.append(f"EMA5↓[{w:.0f}]")
         elif p < e5 < e9 < e21: w = self.weights.get_adjusted_weight("ema_mild_bear"); score += w; signals.append(f"EMA4↓[{w:.0f}]")
         elif p < e5 < e9: w = self.weights.get_adjusted_weight("ema_weak_bear"); score += w; signals.append(f"EMA3↓[{w:.0f}]")
 
-        # 2. Momentum
         if row["m5"] < -0.003: w = self.weights.get_adjusted_weight("mom_strong_neg"); score += w; signals.append(f"Mom{row['m5']*100:.1f}%↓[{w:.0f}]")
         elif row["m5"] < -0.0015: w = self.weights.get_adjusted_weight("mom_moderate_neg"); score += w; signals.append(f"Mom{row['m5']*100:.1f}%↓[{w:.0f}]")
 
-        # 3. MACD
         if prev["mh"] >= 0 and row["mh"] < 0: w = self.weights.get_adjusted_weight("macd_cross_down"); score += w; signals.append(f"MACD_X↓[{w:.0f}]")
         elif row["mh"] < 0 and row["mh"] < prev["mh"] < prev2["mh"]: w = self.weights.get_adjusted_weight("macd_strengthen_neg"); score += w; signals.append(f"MACD↓↓[{w:.0f}]")
 
-        # 4. Order Flow Delta & Aggression
         delta_ratio = row.get("delta_ratio", 0.0)
         buy_ratio = row.get("br", 0.5)
         if delta_ratio < -0.20: w = self.weights.get_adjusted_weight("orderflow_delta_bear"); score += w; signals.append(f"ΔSell{delta_ratio*100:.0f}%[{w:.0f}]")
         elif buy_ratio < 0.45: w = self.weights.get_adjusted_weight("orderflow_sell_high"); score += w; signals.append(f"TakerSell{(1-buy_ratio)*100:.0f}%[{w:.0f}]")
 
-        # 5. Bearish Absorption
         _, bear_abs, _ = AbsorptionDetector.detect(df)
         if bear_abs:
             w = self.weights.get_adjusted_weight("absorption_bear"); score += w; signals.append(f"BearAbsorb[{w:.0f}]")
 
-        # 6. Microstructure Order Book Imbalance
         if symbol:
             imb = order_book.get_imbalance(symbol)
             if imb < IMBALANCE_STRONG_BEAR:
                 w = self.weights.get_adjusted_weight("orderbook_imbalance_bear"); score += w; signals.append(f"BAI{imb*100:.0f}%[{w:.0f}]")
 
-        # 7. RSI
         if 32 <= row["rsi"] <= 52: w = self.weights.get_adjusted_weight("rsi_bear_flow"); score += w; signals.append(f"RSI{row['rsi']:.0f}[{w:.0f}]")
         elif row["rsi"] < 32: w = self.weights.get_adjusted_weight("rsi_extreme_os"); score += w; signals.append(f"RSI{row['rsi']:.0f}OS[{w:.0f}]")
 
@@ -723,8 +646,8 @@ MARKPRICE_FRESH_SEC = 10
 _macro = {"btc": "UNKNOWN"}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
-    "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "trail_exit": 0, "hard_sl": 0, "emg_tp": 0, "regime_block": 0,
+    "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0, "ath_pnl": 0.0, # TRAILING STOP REMOVED: ath_pnl ditambahkan
+    "hard_sl": 0, "tp_exit": 0, "regime_block": 0, # TRAILING STOP REMOVED: trail_exit dihapus
     "wall_veto": 0, "btc_breaker_veto": 0, "spoof_veto": 0, "absorb_entries": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
@@ -737,7 +660,7 @@ scorer         = SignalScorer(signal_weights)
 learning       = LearningLayer(signal_weights)
 
 _last_err_print   = defaultdict(float)
-_api_fail_streak  = 0
+_api_fail_streak = 0
 _api_ok_last      = time.time()
 
 def _log_err(tag, e, cooldown=10):
@@ -821,7 +744,6 @@ def _compute_indicators(df):
     volume = df["volume"].replace(0, 1e-9)
     tbbase = df["tbbase"]
 
-    # Technicals
     df["rsi"] = ta.momentum.RSIIndicator(close, 14).rsi()
     df["mh"]  = ta.trend.MACD(close, 12, 26, 9).macd_diff()
     df["e5"]  = ta.trend.EMAIndicator(close, 5).ema_indicator()
@@ -831,11 +753,9 @@ def _compute_indicators(df):
     df["atr"] = ta.volatility.AverageTrueRange(high, low, close, 14).average_true_range()
     df["adx"] = ta.trend.ADXIndicator(high, low, close, 14).adx()
     
-    # Volume & Moving Averages
     df["vm"]  = volume.rolling(20).mean()
     df["vr"]  = volume / df["vm"].replace(0, 1e-9)
 
-    # Advanced Order Flow & Volume Delta
     taker_buy = tbbase
     taker_sell = (volume - taker_buy).clip(lower=0)
     df["delta"] = taker_buy - taker_sell
@@ -843,7 +763,6 @@ def _compute_indicators(df):
     df["br"]  = taker_buy / volume
     df["cvd"] = df["delta"].rolling(10).sum()
 
-    # Candle Geometry & Wick Analysis
     df["rng"] = (high - low).replace(0, 1e-9)
     df["upper_wick"] = high - df[["close", "open"]].max(axis=1)
     df["lower_wick"] = df[["close", "open"]].min(axis=1) - low
@@ -852,7 +771,6 @@ def _compute_indicators(df):
     df["upper_wick_ratio"] = df["upper_wick"] / df["rng"]
     df["br2"]  = df["body"] / df["rng"]
 
-    # Momentum
     df["m5"]   = (close - close.shift(5)) / close.shift(5)
     df["m3"]   = (close - close.shift(3)) / close.shift(3)
     return df
@@ -951,6 +869,14 @@ def get_real_fill_price(sym, order_resp):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
+    # REVERSE ENTRY: Pembalikan arah posisi eksekusi dari sinyal analisis asli
+    if orig_direction == "LONG":
+        execution_side = "SHORT"
+    elif orig_direction == "SHORT":
+        execution_side = "LONG"
+    else:
+        return
+
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS: return
         live_positions[sym] = {"_r": True}
@@ -964,22 +890,22 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock: live_positions.pop(sym, None)
         return
 
-    # Hitung level risiko dinamis berbasis ATR
-    sl_pct        = risk_profile["sl_pct"]
-    trail_act_pct = risk_profile["trail_act_pct"]
-    trail_gap_pct = risk_profile["trail_gap_pct"]
-    emg_tp_pct    = risk_profile["emg_tp_pct"]
-    sl_price      = risk_profile["sl_price"]
-    emg_tp        = risk_profile["emg_tp_price"]
+    # REVERSED TP/SL: Perhitungan TP & SL baru berbasis execution_side
+    tp_pct   = risk_profile["tp_pct"]
+    sl_pct   = risk_profile["sl_pct"]
+    tp_price = risk_profile["tp_price"]
+    sl_price = risk_profile["sl_price"]
 
+    # TRAILING STOP REMOVED: Variabel trailing dihilangkan sepenuhnya
     pos = {
-        "side": orig_direction, "entry": price, "qty": q_val,
+        "side": execution_side,             # Disimpan berbasis execution_side (setelah reverse)
+        "orig_signal": orig_direction,      # Untuk tracking / log eksperimen
+        "entry": price, "qty": q_val,
         "open_time": time.time(), "score": score, "sigs": sigs,
         "atr": atr, "regime": regime, "bias": bias,
-        "sl_pct": sl_pct, "trail_act_pct": trail_act_pct,
-        "trail_gap_pct": trail_gap_pct, "emg_tp_pct": emg_tp_pct,
-        "sl_price": sl_price, "emergency_tp": emg_tp,
-        "peak_price": price, "trail_active": False, "trail_stop": None,
+        "tp_pct": tp_pct, "sl_pct": sl_pct,
+        "tp_price": tp_price, "sl_price": sl_price,
+        "peak_price": price
     }
     with _lock: live_positions[sym] = pos
 
@@ -987,24 +913,24 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     except Exception: pass
 
     try:
+        # Eksekusi order menggunakan execution_side (bukan orig_direction)
         order = client.futures_create_order(
-            symbol=sym, side='BUY' if orig_direction == 'LONG' else 'SELL',
+            symbol=sym, side='BUY' if execution_side == 'LONG' else 'SELL',
             type='MARKET', quantity=q_val, newOrderRespType='RESULT'
         )
         real_px = get_real_fill_price(sym, order)
         if real_px > 0:
             price = real_px
-            new_risk = DynamicRiskManager.calculate_levels(price, orig_direction, atr)
+            # Hitung ulang level TP/SL berbasis harga fill sesungguhnya dan execution_side
+            new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
             with _lock:
                 if sym in live_positions and not live_positions[sym].get('_r'):
                     live_positions[sym].update({
                         'entry': price,
+                        'tp_pct': new_risk["tp_pct"],
                         'sl_pct': new_risk["sl_pct"],
-                        'trail_act_pct': new_risk["trail_act_pct"],
-                        'trail_gap_pct': new_risk["trail_gap_pct"],
-                        'emg_tp_pct': new_risk["emg_tp_pct"],
+                        'tp_price': new_risk["tp_price"],
                         'sl_price': new_risk["sl_price"],
-                        'emergency_tp': new_risk["emg_tp_price"],
                         'peak_price': price
                     })
         print(f"         ✅ ORDER #{order.get('orderId')} | fill:{price:.6g} | qty:{q_val}")
@@ -1013,10 +939,9 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock: live_positions.pop(sym, None)
         return
 
-    d = "🟢" if orig_direction == "LONG" else "🔴"
+    d = "🟢" if execution_side == "LONG" else "🔴"
     imb_str = f" | BAI:{order_book.get_imbalance(sym)*100:+.0f}%" if order_book.get_book(sym) else ""
-    tag = "[INSTITUTIONAL v22 INVERTED]" if INVERT_SIGNALS else "[INSTITUTIONAL v22]"
-    print(f"\n  {d} {tag} {sym} {orig_direction} @{price:.6g} | SL:{sl_pct*100:.2f}% (1.8x ATR) | Trail:±{trail_gap_pct*100:.2f}% (Act:{trail_act_pct*100:.2f}%){imb_str} | Regime:{regime}")
+    print(f"\n  {d} [REVERSED ENGINE v22] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% (dulu SL) | SL:{sl_pct*100:.2f}% (dulu TP){imb_str} | Regime:{regime}")
     print(f"         Signals: {' | '.join(sigs[:6])}")
     _stats["trades"] += 1
     if any("Absorb" in s for s in sigs):
@@ -1063,11 +988,7 @@ def live_close(sym, reason, price=None):
     peak_px  = pos.get("peak_price", entry)
     peak_pct = (peak_px - entry) / entry if side == "LONG" else (entry - peak_px) / entry
 
-    trail_info = f" | peak:{peak_pct*100:+.3f}%"
-    if pos.get("trail_active"): trail_info += " ✅trail_was_active"
-
-    tag = "[INSTITUTIONAL v22 INVERTED]" if INVERT_SIGNALS else "[INSTITUTIONAL v22]"
-    print(f"  {e_icon} {tag} {sym} {side} CLOSE — {reason}{trail_info}")
+    print(f"  {e_icon} [REVERSED ENGINE v22] {sym} {side} CLOSE — {reason} | peak:{peak_pct*100:+.3f}%")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
 
     trade = TradeRecord(
@@ -1080,6 +1001,11 @@ def live_close(sym, reason, price=None):
 
     _stats["pnl"] += pnl
     _stats["hist"].append(pnl)
+    
+    # TRACKING ATH PNL: Update PnL Tertinggi / ATH jika PnL kumulatif mencapai puncaknya
+    if _stats["pnl"] > _stats["ath_pnl"]:
+        _stats["ath_pnl"] = _stats["pnl"]
+
     ks_upd(pnl)
 
     if won:
@@ -1089,9 +1015,9 @@ def live_close(sym, reason, price=None):
         _stats["losses"] += 1
         if pnl < _stats["worst"]: _stats["worst"] = pnl
 
-    if "TRAIL" in reason: _stats["trail_exit"] += 1
-    elif "SL" in reason: _stats["hard_sl"] += 1
-    elif "TP" in reason: _stats["emg_tp"] += 1
+    # TRAILING STOP REMOVED: Hapus pencatatan exit karena trailing
+    if "SL" in reason: _stats["hard_sl"] += 1
+    elif "TP" in reason: _stats["tp_exit"] += 1
 
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7), "exit": round(price, 7),
@@ -1119,45 +1045,24 @@ def monitor_positions():
             pos["_fail_count"] = pos.get("_fail_count", 0) + 1
             fc = pos["_fail_count"]
             if fc in (5, 20, 60) or fc % 300 == 0:
-                print(f"  ⚠️ {sym}: price_live gagal {fc}x — SL/TP/Trailing tertunda")
+                print(f"  ⚠️ {sym}: price_live gagal {fc}x — SL/TP monitoring tertunda")
             continue
         pos["_fail_count"] = 0
 
-        side, entry, sl_px, emg_tp = pos["side"], pos["entry"], pos["sl_price"], pos["emergency_tp"]
-        act_thresh = pos.get("trail_act_pct", 0.015)
-        gap        = pos.get("trail_gap_pct", 0.005)
+        side, tp_px, sl_px = pos["side"], pos["tp_price"], pos["sl_price"]
 
         if side == "LONG":
             if px > pos["peak_price"]: pos["peak_price"] = px
         else:
             if px < pos["peak_price"]: pos["peak_price"] = px
-        peak = pos["peak_price"]
 
-        # Hard SL & Emergency TP
-        if side == "LONG" and px <= sl_px: live_close(sym, "SL", sl_px); continue
-        if side == "SHORT" and px >= sl_px: live_close(sym, "SL", sl_px); continue
-        if side == "LONG" and px >= emg_tp: live_close(sym, "TP_EMG", emg_tp); continue
-        if side == "SHORT" and px <= emg_tp: live_close(sym, "TP_EMG", emg_tp); continue
-
-        # Dynamic ATR Trailing Activation
-        if not pos["trail_active"]:
-            profit_pct = (peak - entry) / entry if side == "LONG" else (entry - peak) / entry
-            if profit_pct >= act_thresh:
-                pos["trail_active"] = True
-                pos["trail_stop"] = peak * (1 - gap) if side == "LONG" else peak * (1 + gap)
-                print(f"  🔔 [DYNAMIC TRAIL ON] {sym} {side} | profit:{profit_pct*100:.3f}% (target:{act_thresh*100:.2f}%) | stop:{pos['trail_stop']:.6g} (gap:±{gap*100:.2f}%)")
-
-        # Dynamic Trailing Stop Tracking
-        if pos["trail_active"]:
-            ts = pos["trail_stop"]
-            if side == "LONG":
-                new_ts = peak * (1 - gap)
-                if new_ts > ts: pos["trail_stop"] = new_ts; ts = new_ts
-                if px <= ts: live_close(sym, "TRAIL", ts); continue
-            else:
-                new_ts = peak * (1 + gap)
-                if new_ts < ts: pos["trail_stop"] = new_ts; ts = new_ts
-                if px >= ts: live_close(sym, "TRAIL", ts); continue
+        # REVERSED TP/SL & NO TRAILING: Monitoring HANYA menggunakan TP Baru, SL Baru, dan Time Limit
+        if side == "LONG":
+            if px >= tp_px: live_close(sym, "TP", tp_px); continue
+            if px <= sl_px: live_close(sym, "SL", sl_px); continue
+        elif side == "SHORT":
+            if px <= tp_px: live_close(sym, "TP", tp_px); continue
+            if px >= sl_px: live_close(sym, "SL", sl_px); continue
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  6. SCANNER THREAD & HARD VETO FILTERS
@@ -1172,50 +1077,52 @@ def scan_one(sym):
         px_candle, atr_val = df_ta["close"].iloc[-2], df_ta["atr"].iloc[-2]
         if px_candle == 0 or np.isnan(atr_val): return None
 
-        direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
-        if direction is None: return None
+        orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
+        if orig_direction is None: return None
+
+        # REVERSE ENTRY: Tentukan execution_side untuk keperluan filter veto
+        execution_side = "SHORT" if orig_direction == "LONG" else "LONG"
 
         px_live = price_live(sym)
         if px_live == 0: return None
 
+        # Filter Veto dijalankan berbasis execution_side (arah aktual yang dieksekusi)
         # ── VETO FILTER 1: BTC Flash Crash / Pump Circuit Breaker ────────────
-        btc_vetoed, btc_reason = btc_macro.check_veto(direction)
+        btc_vetoed, btc_reason = btc_macro.check_veto(execution_side)
         if btc_vetoed:
             _stats["btc_breaker_veto"] += 1
-            print(f"  ⛔ [{sym}] {direction} VETOED by BTC Circuit Breaker: {btc_reason}")
+            print(f"  ⛔ [{sym}] {execution_side} VETOED by BTC Circuit Breaker: {btc_reason}")
             return None
 
-        # ── VETO FILTER 2: Order Book Wall Detection (Sell/Buy Wall <= 0.5%) ──
-        has_wall, wall_type, wall_px, wall_qty, wall_mult = order_book.check_walls(sym, px_live, direction)
+        # ── VETO FILTER 2: Order Book Wall Detection ──────────────────────────
+        has_wall, wall_type, wall_px, wall_qty, wall_mult = order_book.check_walls(sym, px_live, execution_side)
         if has_wall:
             _stats["wall_veto"] += 1
-            print(f"  ⛔ [{sym}] {direction} VETOED by {wall_type} @ {wall_px:.6g} (qty:{wall_qty:.1f}, {wall_mult:.1f}x avg depth)")
+            print(f"  ⛔ [{sym}] {execution_side} VETOED by {wall_type} @ {wall_px:.6g} (qty:{wall_qty:.1f}, {wall_mult:.1f}x avg depth)")
             return None
 
         # ── VETO FILTER 3: Spoofing & Liquidity Pull Detection ────────────────
-        is_spoof, spoof_reason = order_book.detect_spoofing(sym, direction)
+        is_spoof, spoof_reason = order_book.detect_spoofing(sym, execution_side)
         if is_spoof:
             _stats["spoof_veto"] += 1
-            print(f"  ⛔ [{sym}] {direction} VETOED: Spoofing detected ({spoof_reason})")
+            print(f"  ⛔ [{sym}] {execution_side} VETOED: Spoofing detected ({spoof_reason})")
             return None
 
         # ── VETO FILTER 4: Order Book Imbalance Guard ─────────────────────────
         imb = order_book.get_imbalance(sym)
-        if direction == "LONG" and imb < -0.40:
-            # 40%+ lebih banyak antrean ask daripada bid -> jangan long ke tembok seller
+        if execution_side == "LONG" and imb < -0.40:
             _stats["wall_veto"] += 1
             print(f"  ⛔ [{sym}] LONG VETOED: Heavy Ask Queue Imbalance ({imb*100:.0f}%)")
             return None
-        elif direction == "SHORT" and imb > 0.40:
-            # 40%+ lebih banyak antrean bid daripada ask -> jangan short ke tembok buyer
+        elif execution_side == "SHORT" and imb > 0.40:
             _stats["wall_veto"] += 1
             print(f"  ⛔ [{sym}] SHORT VETOED: Heavy Bid Queue Imbalance ({imb*100:.0f}%)")
             return None
 
-        # ── Hitung Dynamic Risk Profile Berbasis ATR ──────────────────────────
-        risk_profile = DynamicRiskManager.calculate_levels(px_live, direction, atr_val)
+        # ── Hitung Dynamic Risk Profile Berbasis Execution Side & REVERSED TP/SL ──
+        risk_profile = DynamicRiskManager.calculate_levels(px_live, execution_side, atr_val)
 
-        return (sym, direction, score, sigs, px_live, atr_val, regime, bias, risk_profile)
+        return (sym, orig_direction, score, sigs, px_live, atr_val, regime, bias, risk_profile)
     except Exception as e:
         _log_err(f"scan_one_{sym}", e)
         return None
@@ -1242,9 +1149,9 @@ def print_inline():
     aw = learning.avg_win()
     avg_pk = learning.avg_peak_win()
     e = "💚" if pnl >= 0 else "🔴"
-    tag = "[INSTITUTIONAL v22 INVERTED]" if INVERT_SIGNALS else "[INSTITUTIONAL v22]"
-    print(f"       ┌ {tag} {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
-    print(f"       └ Trail:{_stats['trail_exit']} SL:{_stats['hard_sl']} Absorb:{_stats['absorb_entries']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
+    # TRAILING STOP REMOVED: Tampilan log ringkas diperbarui
+    print(f"       ┌ [REVERSED ENGINE v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
+    print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Absorb:{_stats['absorb_entries']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -1255,14 +1162,14 @@ def print_full():
     e = "💚" if pnl >= 0 else "🔴"
     aw, al = learning.avg_win(), learning.avg_loss()
     bep = al / (al + aw) * 100 if (al + aw) > 0 else 50
-    avg_pk_win = learning.avg_peak_win()
 
-    sub_title = " (INVERSE / CONTRARIAN MODE)" if INVERT_SIGNALS else ""
     print(f"\n  {'─'*72}")
-    print(f"    🔔 INSTITUTIONAL SCALPING v22 LIVE DASHBOARD{sub_title}")
+    print(f"    🔔 INSTITUTIONAL SCALPING v22 LIVE DASHBOARD (REVERSED MODE)")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
-    print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"    📈 Exit: Trail:{_stats['trail_exit']} | SL:{_stats['hard_sl']} | EmgTP:{_stats['emg_tp']}")
+    # ADDED ATH PNL: Menampilkan PnL Kumulatif Tertinggi (ATH PnL)
+    print(f"    {e} PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U | Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
+    # TRAILING STOP REMOVED: Log exit dashboard tanpa trailing stop
+    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']}")
     print(f"    🛡️ Veto Stats: Wall Veto:{_stats['wall_veto']} | BTC Breaker:{_stats['btc_breaker_veto']} | Spoof:{_stats['spoof_veto']}")
     print(f"    ⚡ Absorption Entries: {_stats['absorb_entries']} | BEP WR:{bep:.1f}%")
 
@@ -1349,8 +1256,6 @@ def t_macro():
                 _btc_macro["m5"] = row.get("m5", 0.0)
                 _btc_macro["delta_ratio"] = row.get("delta_ratio", 0.0)
                 _btc_macro["cvd"] = row.get("cvd", 0.0)
-                if btc_macro.last_price == 0.0 and len(df_btc) > 0:
-                    btc_macro.update_tick(float(df_btc.iloc[-1]["close"]))
         except Exception as e:
             _log_err("t_macro", e)
         time.sleep(10)
@@ -1390,10 +1295,7 @@ def handle_mark_price(msg):
             sym, px = d.get("s"), d.get("p")
             if sym and px:
                 pf = float(px)
-                if pf > 0:
-                    _ws_mark_price[sym] = (pf, now)
-                    if sym == "BTCUSDT" and btc_macro.last_price == 0.0:
-                        btc_macro.update_tick(pf, now)
+                if pf > 0: _ws_mark_price[sym] = (pf, now)
     except Exception as e:
         _log_err("handle_mark_price", e)
 
@@ -1411,7 +1313,6 @@ def handle_kline_multiplex(msg):
         _log_err("handle_kline_multiplex", e)
 
 def handle_btc_aggtrade(msg):
-    """Tick-by-tick BTCUSDT trade stream untuk deteksi Flash Crash/Pump."""
     global _ws_last_msg_ts
     try:
         _ws_last_msg_ts = time.time()
@@ -1426,7 +1327,6 @@ def handle_btc_aggtrade(msg):
         _log_err("handle_btc_aggtrade", e)
 
 def handle_depth_multiplex(msg):
-    """Order Book depth10 stream untuk micro-structure, imbalance & wall detection."""
     global _ws_last_msg_ts
     try:
         _ws_last_msg_ts = time.time()
@@ -1477,36 +1377,27 @@ def t_ws_watchdog():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    if INVERT_SIGNALS:
-        print("║  🔄 BOT SCALPING v22.0 LIVE — INVERSE / CONTRARIAN QUANT ENGINE    ║")
-        print("║  ★ INVERT MODE ACTIVE: Analysis LONG -> SHORT | SHORT -> LONG      ║")
-    else:
-        print("║  💎 BOT SCALPING v22.0 LIVE — INSTITUTIONAL QUANT ENGINE (Binance)   ║")
-    print("║  1. Microstructure: @depth10, Bid-Ask Imbalance, Sell/Buy Wall Veto ║")
-    print("║  2. Macro Tick: BTC Flash Crash/Pump Breaker (aggTrade, 120s Veto) ║")
-    print("║  3. Order Flow: Volume Delta, CVD & Institutional Absorption        ║")
-    print("║  4. Risk: Dynamic ATR Trailing & Stop Loss Scaling                ║")
+    print("║  💎 BOT SCALPING v22.0 LIVE — REVERSED TRADING EXPERIMENT          ║")
+    print("║  1. Signal LONG  -> Execute SHORT | Signal SHORT -> Execute LONG   ║")
+    print("║  2. TP Baru = Jarak SL Lama (1.8x ATR)                             ║")
+    print("║  3. SL Baru = Jarak TP Lama (3.5x ATR)                             ║")
+    print("║  4. Trailing Stop REMOVED | Tracking ATH PnL Enabled               ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try: valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
     except: valid = set(SYMBOLS)
     syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
 
-    # ── 1) Bootstrap history awal ──
     bootstrap_all_klines(syms)
 
-    # ── 2) Nyalakan WebSocket Streams ──
     twm.start()
     twm.start_all_mark_price_socket(callback=handle_mark_price, fast=True)
     twm.start_futures_multiplex_socket(callback=handle_all_ticker, streams=["!ticker@arr"])
     
-    # Kline 5m streams
     kline_streams = [f"{s.lower()}@kline_5m" for s in syms]
     twm.start_futures_multiplex_socket(callback=handle_kline_multiplex, streams=kline_streams)
     
-    # BTCUSDT aggTrade stream (tick-by-tick flash crash/pump detector)
     twm.start_futures_multiplex_socket(callback=handle_btc_aggtrade, streams=["btcusdt@aggtrade"])
     
-    # Order Book @depth10 streams (microstructure & walls)
     depth_streams = [f"{s.lower()}@depth10" for s in syms]
     twm.start_futures_multiplex_socket(callback=handle_depth_multiplex, streams=depth_streams)
 
@@ -1535,11 +1426,11 @@ def run_bot():
         btc_status = btc_macro.get_status_str()
         veto_summary = f"Veto[Wall:{_stats['wall_veto']}|BTC:{_stats['btc_breaker_veto']}|Spoof:{_stats['spoof_veto']}]"
 
-        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC_5M:{_macro['btc']} ({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U | {veto_summary}{api_flag}{ws_flag}")
-        print(f"       ↳ {btc_status}")
+        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC_5M:{_macro['btc']} ({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U) | {veto_summary}{api_flag}{ws_flag}")
+        print(f"        ↳ {btc_status}")
 
         if (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}")
-        elif slots == 0: print(f"  ✅ Slots full — trailing aktif di posisi terbuka")
+        elif slots == 0: print(f"  ✅ Slots full — monitoring posisi terbuka (TP/SL Only)")
         else: print(f"  🔍 {slots} slot kosong — scanning order book & flow...")
         if cycle % 30 == 0: print_full()
         time.sleep(SCAN_INTERVAL)
