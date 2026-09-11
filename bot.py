@@ -81,7 +81,7 @@ ATR_TP_OLD_AS_SL_NEW_MULTIPLIER = 3.5   # SL Baru = 3.5x ATR (dulu TP)
 MIN_TP_PCT        = 0.008  # 0.8% minimum TP
 MAX_TP_PCT        = 0.035  # 3.5% maximum TP
 MIN_SL_PCT        = 0.025  # 2.5% minimum SL
-MAX_SL_PCT        = 0.080  # 8.0% maximum SL
+MAX_SL_PCT        = 0.035  # 8.0% maximum SL
 MAX_HOLD_SECONDS  = 10800  # 3 Jam batas maksimal tahan posisi
 # ──────────────────────────────────────────────────────────────────────────
 
