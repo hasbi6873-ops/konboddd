@@ -87,7 +87,7 @@ TTL_5M         = 2
 # WAJIB testnet secara default (client di atas sudah dipaksa testnet). Tambahan:
 # DRY_RUN=True -> tidak mengirim order sungguhan, hanya simulasi (paper) + logging.
 # Set False secara SADAR hanya setelah puas dengan hasil shadow/dry-run.
-DRY_RUN = True
+DRY_RUN = False
 
 # STRATEGY_MODE:
 #   ADVERSARIAL   -> pipeline penuh (failure engine + conditional reverse + entry window)
