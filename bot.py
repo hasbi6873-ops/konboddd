@@ -25,18 +25,35 @@ from binance import ThreadedWebsocketManager
 import ta
 
 load_dotenv()
-
 client = Client(
     os.getenv("API_KEY"),
-    os.getenv("API_SECRET")
+    os.getenv("API_SECRET"),
+    demo=True,
 )
+# Binance Demo Trading: semua REST Futures diarahkan ke Demo, bukan production.
+# Demo API saat ini menggunakan https://demo-fapi.binance.com untuk USDⓈ-M Futures.
+try:
+    client.FUTURES_TESTNET_URL = "https://demo-fapi.binance.com/fapi"
+    client.FUTURES_URL = "https://demo-fapi.binance.com/fapi"
+except Exception:
+    pass
 
-client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
-
-twm = ThreadedWebsocketManager(
-    api_key=os.getenv("API_KEY"),
-    api_secret=os.getenv("API_SECRET")
-)
+# 🔧 v21: WebSocket manager — dipakai untuk mark price & kline streams supaya
+# tidak lagi polling REST tiap 0.1-2 detik (itu penyebab rate-limit ban).
+# REST cuma dipakai untuk: bootstrap history sekali di awal, kirim order, dan
+# fallback darurat kalau data websocket basi/hilang.
+try:
+    twm = ThreadedWebsocketManager(
+        api_key=os.getenv("API_KEY"),
+        api_secret=os.getenv("API_SECRET"),
+        demo=True,
+    )
+except TypeError:
+    # Fallback untuk python-binance lama yang belum menerima demo=True.
+    twm = ThreadedWebsocketManager(
+        api_key=os.getenv("API_KEY"),
+        api_secret=os.getenv("API_SECRET"),
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -1377,7 +1394,8 @@ def t_ws_watchdog():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  🔴 TRAIL v21 LIVE — QUALITY ENTRY + SMART EXIT + WS + PERSISTENT LEARNING ║")
+    print("║  🟠 TRAIL v21 DEMO — QUALITY ENTRY + SMART EXIT + WS + PERSISTENT LEARNING ║")
+    print("║  ✅ Binance Futures DEMO — bukan akun real                              ║")
     print("║  ✅ Pullback→Reversal confirmation + BTC macro alignment                  ║")
     print("║  ✅ Stale/Thesis exit + ATR adaptive trailing + 30m hard time limit       ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
@@ -1388,16 +1406,16 @@ def run_bot():
     # ── 1) Bootstrap history REST SEKALI SAJA sebelum websocket mulai mengalir ──
     bootstrap_all_klines(syms)
 
-    # ── 2) Nyalakan WebSocket: mark price (semua simbol) + kline (simbol yg dipantau) + user data
+    # ── 2) Nyalakan WebSocket market Demo: mark price + kline.
+    # User-data socket sengaja TIDAK dijalankan. Bot tidak membutuhkannya untuk
+    # entry/exit; ini juga menghindari library lama yang masih meminta listenKey
+    # ke endpoint production dan memicu 401/-2015.
     twm.start()
     twm.start_all_mark_price_socket(callback=handle_mark_price, fast=True)
     kline_streams = [f"{s.lower()}@kline_5m" for s in syms]
     twm.start_futures_multiplex_socket(callback=handle_kline_multiplex, streams=kline_streams)
-    try:
-        twm.start_futures_user_socket(callback=handle_user_data)
-    except Exception as e:
-        _log_err("user_data_stream_start", e, cooldown=0)
-        print("  ⚠️ User data stream gagal start (opsional) — bot tetap jalan tanpa event order real-time")
+    print("  ✅ Demo WebSocket market aktif (mark price + kline)")
+    print("  ℹ️ User-data WebSocket DISABLED — monitoring posisi tetap memakai state lokal + REST order fill")
 
     threading.Thread(target=t_ws_watchdog, daemon=True).start()
     threading.Thread(target=t_monitor, daemon=True).start()
