@@ -82,7 +82,7 @@ MIN_TP_PCT        = 0.008  # 0.8% minimum TP
 MAX_TP_PCT        = 0.035  # 3.5% maximum TP
 MIN_SL_PCT        = 0.025  # 2.5% minimum SL
 MAX_SL_PCT        = 0.035  # 8.0% maximum SL
-MAX_HOLD_SECONDS  = 3600  # 3 Jam batas maksimal tahan posisi
+MAX_HOLD_SECONDS  = 3600   # 3 Jam batas maksimal tahan posisi
 # ──────────────────────────────────────────────────────────────────────────
 
 # ── Institutional Microstructure (Order Book Depth) ───────────────────────
