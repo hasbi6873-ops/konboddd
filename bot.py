@@ -25,14 +25,18 @@ from binance import ThreadedWebsocketManager
 import ta
 
 load_dotenv()
-client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
+
+client = Client(
+    os.getenv("API_KEY"),
+    os.getenv("API_SECRET")
+)
+
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
-# 🔧 v21: WebSocket manager — dipakai untuk mark price & kline streams supaya
-# tidak lagi polling REST tiap 0.1-2 detik (itu penyebab rate-limit ban).
-# REST cuma dipakai untuk: bootstrap history sekali di awal, kirim order, dan
-# fallback darurat kalau data websocket basi/hilang.
-twm = ThreadedWebsocketManager(api_key=os.getenv("API_KEY"), api_secret=os.getenv("API_SECRET"))
+twm = ThreadedWebsocketManager(
+    api_key=os.getenv("API_KEY"),
+    api_secret=os.getenv("API_SECRET")
+)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
