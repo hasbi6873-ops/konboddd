@@ -1,11 +1,11 @@
 """
 Bot Scalping v22.0 LIVE — INSTITUTIONAL QUANT ENGINE (Binance Futures)
 ====================================================================
-MODIFIKASI EKSPERIMEN: REVERSE TRADING & SWAPPED TP/SL (NO TRAILING STOP)
-- Signal Asli LONG  -> Eksekusi SHORT
-- Signal Asli SHORT -> Eksekusi LONG
-- Jarak TP Baru = Jarak SL Lama (1.8x ATR)
-- Jarak SL Baru = Jarak TP Lama (Emergency TP 3.5x ATR)
+MODIFIKASI EKSPERIMEN: INVERT CURRENT LOSING MODE (ORIGINAL ENTRY & ORIGINAL TP/SL)
+- Signal Asli LONG  -> Eksekusi LONG
+- Signal Asli SHORT -> Eksekusi SHORT
+- Jarak TP = jarak SL mode reverse sebelumnya (3.5x ATR)
+- Jarak SL = jarak TP mode reverse sebelumnya (1.8x ATR)
 - Trailing Stop Dihapus Sepenuhnya
 - Penambahan Tracking ATH PnL (Highest Peak Cumulative PnL) pada Dashboard
 """
@@ -72,16 +72,16 @@ SLIPPAGE_GUARD = 0.0015
 TTL_5M         = 2
 
 # ── Dynamic Volatility Risk Management (ATR Multipliers) ───────────────────
-# REVERSED TP/SL:
-# SL Lama (1.8x ATR) dijadikan TP Baru
-# TP Lama (3.5x ATR) dijadikan SL Baru
-ATR_SL_OLD_AS_TP_NEW_MULTIPLIER = 1.8   # TP Baru = 1.8x ATR (dulu SL)
-ATR_TP_OLD_AS_SL_NEW_MULTIPLIER = 3.5   # SL Baru = 3.5x ATR (dulu TP)
+# KEBALIKAN DARI MODE LOSS SAAT INI:
+# TP dikembalikan ke jarak SL mode reverse sebelumnya (3.5x ATR)
+# SL dikembalikan ke jarak TP mode reverse sebelumnya (1.8x ATR)
+ATR_TP_RESTORED_MULTIPLIER = 3.5
+ATR_SL_RESTORED_MULTIPLIER = 1.8
 
-MIN_TP_PCT        = 0.008  # 0.8% minimum TP
-MAX_TP_PCT        = 0.035  # 3.5% maximum TP
-MIN_SL_PCT        = 0.025  # 2.5% minimum SL
-MAX_SL_PCT        = 0.035  # 8.0% maximum SL
+MIN_TP_PCT        = 0.025
+MAX_TP_PCT        = 0.035
+MIN_SL_PCT        = 0.008
+MAX_SL_PCT        = 0.035
 MAX_HOLD_SECONDS  = 3600   # 3 Jam batas maksimal tahan posisi
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -352,14 +352,13 @@ class AbsorptionDetector:
 class DynamicRiskManager:
     @staticmethod
     def calculate_levels(entry_price: float, execution_side: str, atr: float) -> Dict[str, float]:
-        # REVERSED TP/SL:
-        # Menggunakan jarak execution_side aktual
+        # KEBALIKAN MODE LOSS SAAT INI.
         atr_pct = (atr / entry_price) if entry_price > 0 else 0.015
-        
-        # Jarak TP baru diambil dari perkalian SL lama (1.8x ATR)
-        tp_pct = max(MIN_TP_PCT, min(MAX_TP_PCT, ATR_SL_OLD_AS_TP_NEW_MULTIPLIER * atr_pct))
-        # Jarak SL baru diambil dari perkalian TP lama (3.5x ATR)
-        sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_TP_OLD_AS_SL_NEW_MULTIPLIER * atr_pct))
+
+        # TP = jarak SL pada mode reverse sebelumnya: 3.5x ATR.
+        tp_pct = max(MIN_TP_PCT, min(MAX_TP_PCT, ATR_TP_RESTORED_MULTIPLIER * atr_pct))
+        # SL = jarak TP pada mode reverse sebelumnya: 1.8x ATR.
+        sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_RESTORED_MULTIPLIER * atr_pct))
 
         if execution_side == "LONG":
             tp_price = entry_price * (1 + tp_pct)
@@ -869,11 +868,9 @@ def get_real_fill_price(sym, order_resp):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
-    # REVERSE ENTRY: Pembalikan arah posisi eksekusi dari sinyal analisis asli
-    if orig_direction == "LONG":
-        execution_side = "SHORT"
-    elif orig_direction == "SHORT":
-        execution_side = "LONG"
+    # KEBALIKAN MODE LOSS SAAT INI: kembali mengikuti signal asli.
+    if orig_direction in ("LONG", "SHORT"):
+        execution_side = orig_direction
     else:
         return
 
@@ -890,7 +887,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock: live_positions.pop(sym, None)
         return
 
-    # REVERSED TP/SL: Perhitungan TP & SL baru berbasis execution_side
+    # RESTORED TP/SL: Perhitungan TP & SL baru berbasis execution_side
     tp_pct   = risk_profile["tp_pct"]
     sl_pct   = risk_profile["sl_pct"]
     tp_price = risk_profile["tp_price"]
@@ -924,7 +921,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
             # Hitung ulang level TP/SL berbasis harga fill sesungguhnya dan execution_side
             new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
             with _lock:
-                if sym in live_positions and not live_positions[sym].get('_r'):
+                if sym in live_positions:
                     live_positions[sym].update({
                         'entry': price,
                         'tp_pct': new_risk["tp_pct"],
@@ -941,7 +938,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
 
     d = "🟢" if execution_side == "LONG" else "🔴"
     imb_str = f" | BAI:{order_book.get_imbalance(sym)*100:+.0f}%" if order_book.get_book(sym) else ""
-    print(f"\n  {d} [REVERSED ENGINE v22] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% (dulu SL) | SL:{sl_pct*100:.2f}% (dulu TP){imb_str} | Regime:{regime}")
+    print(f"\n  {d} [INVERTED-BACK ENGINE v22] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% (dulu SL) | SL:{sl_pct*100:.2f}% (dulu TP){imb_str} | Regime:{regime}")
     print(f"         Signals: {' | '.join(sigs[:6])}")
     _stats["trades"] += 1
     if any("Absorb" in s for s in sigs):
@@ -988,7 +985,7 @@ def live_close(sym, reason, price=None):
     peak_px  = pos.get("peak_price", entry)
     peak_pct = (peak_px - entry) / entry if side == "LONG" else (entry - peak_px) / entry
 
-    print(f"  {e_icon} [REVERSED ENGINE v22] {sym} {side} CLOSE — {reason} | peak:{peak_pct*100:+.3f}%")
+    print(f"  {e_icon} [INVERTED-BACK ENGINE v22] {sym} {side} CLOSE — {reason} | peak:{peak_pct*100:+.3f}%")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
 
     trade = TradeRecord(
@@ -1056,7 +1053,7 @@ def monitor_positions():
         else:
             if px < pos["peak_price"]: pos["peak_price"] = px
 
-        # REVERSED TP/SL & NO TRAILING: Monitoring HANYA menggunakan TP Baru, SL Baru, dan Time Limit
+        # RESTORED TP/SL & NO TRAILING: Monitoring HANYA menggunakan TP Baru, SL Baru, dan Time Limit
         if side == "LONG":
             if px >= tp_px: live_close(sym, "TP", tp_px); continue
             if px <= sl_px: live_close(sym, "SL", sl_px); continue
@@ -1080,8 +1077,8 @@ def scan_one(sym):
         orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
         if orig_direction is None: return None
 
-        # REVERSE ENTRY: Tentukan execution_side untuk keperluan filter veto
-        execution_side = "SHORT" if orig_direction == "LONG" else "LONG"
+        # KEBALIKAN MODE LOSS SAAT INI: execution mengikuti signal asli.
+        execution_side = orig_direction
 
         px_live = price_live(sym)
         if px_live == 0: return None
@@ -1150,7 +1147,7 @@ def print_inline():
     avg_pk = learning.avg_peak_win()
     e = "💚" if pnl >= 0 else "🔴"
     # TRAILING STOP REMOVED: Tampilan log ringkas diperbarui
-    print(f"       ┌ [REVERSED ENGINE v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
+    print(f"       ┌ [INVERTED-BACK ENGINE v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
     print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Absorb:{_stats['absorb_entries']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
 
 def print_full():
@@ -1164,7 +1161,7 @@ def print_full():
     bep = al / (al + aw) * 100 if (al + aw) > 0 else 50
 
     print(f"\n  {'─'*72}")
-    print(f"    🔔 INSTITUTIONAL SCALPING v22 LIVE DASHBOARD (REVERSED MODE)")
+    print(f"    🔔 INSTITUTIONAL SCALPING v22 LIVE DASHBOARD (INVERTED-BACK MODE)")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     # ADDED ATH PNL: Menampilkan PnL Kumulatif Tertinggi (ATH PnL)
     print(f"    {e} PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U | Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
@@ -1377,10 +1374,10 @@ def t_ws_watchdog():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  💎 BOT SCALPING v22.0 LIVE — REVERSED TRADING EXPERIMENT          ║")
-    print("║  1. Signal LONG  -> Execute SHORT | Signal SHORT -> Execute LONG   ║")
-    print("║  2. TP Baru = Jarak SL Lama (1.8x ATR)                             ║")
-    print("║  3. SL Baru = Jarak TP Lama (3.5x ATR)                             ║")
+    print("║  💎 BOT SCALPING v22.0 LIVE — INVERTED-BACK TRADING EXPERIMENT     ║")
+    print("║  1. Signal LONG  -> Execute LONG | Signal SHORT -> Execute SHORT   ║")
+    print("║  2. TP = Jarak SL mode reverse (3.5x ATR)                          ║")
+    print("║  3. SL = Jarak TP mode reverse (1.8x ATR)                          ║")
     print("║  4. Trailing Stop REMOVED | Tracking ATH PnL Enabled               ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try: valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
