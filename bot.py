@@ -80,9 +80,9 @@ ATR_SL_RESTORED_MULTIPLIER = 1.8
 
 MIN_TP_PCT        = 0.025
 MAX_TP_PCT        = 0.035
-MIN_SL_PCT        = 0.008
+MIN_SL_PCT        = 0.025
 MAX_SL_PCT        = 0.035
-MAX_HOLD_SECONDS  = 3600   # 3 Jam batas maksimal tahan posisi
+MAX_HOLD_SECONDS  = 6120   # 3 Jam batas maksimal tahan posisi
 # ──────────────────────────────────────────────────────────────────────────
 
 # ── Institutional Microstructure (Order Book Depth) ───────────────────────
