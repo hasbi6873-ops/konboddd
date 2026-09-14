@@ -352,13 +352,13 @@ class AbsorptionDetector:
 class DynamicRiskManager:
     @staticmethod
     def calculate_levels(entry_price: float, execution_side: str, atr: float) -> Dict[str, float]:
-        # KEBALIKAN MODE LOSS SAAT INI.
+        # MODIFIKASI: Gunakan rasio TP & SL yang memicu loss pada mode saat ini
         atr_pct = (atr / entry_price) if entry_price > 0 else 0.015
 
-        # TP = jarak SL pada mode reverse sebelumnya: 3.5x ATR.
-        tp_pct = max(MIN_TP_PCT, min(MAX_TP_PCT, ATR_TP_RESTORED_MULTIPLIER * atr_pct))
-        # SL = jarak TP pada mode reverse sebelumnya: 1.8x ATR.
-        sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_RESTORED_MULTIPLIER * atr_pct))
+        # TP = 1.8x ATR (Lebih dekat agar cepat kena TP saat reverse)
+        # SL = 3.5x ATR (Lebih lebar)
+        tp_pct = max(MIN_TP_PCT, min(MAX_TP_PCT, 1.8 * atr_pct))
+        sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, 3.5 * atr_pct))
 
         if execution_side == "LONG":
             tp_price = entry_price * (1 + tp_pct)
@@ -868,9 +868,11 @@ def get_real_fill_price(sym, order_resp):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
-    # KEBALIKAN MODE LOSS SAAT INI: kembali mengikuti signal asli.
-    if orig_direction in ("LONG", "SHORT"):
-        execution_side = orig_direction
+    # MODIFIKASI: Membalik sinyal entry (Inverse current losing strategy)
+    if orig_direction == "LONG":
+        execution_side = "SHORT"
+    elif orig_direction == "SHORT":
+        execution_side = "LONG"
     else:
         return
 
@@ -887,16 +889,16 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock: live_positions.pop(sym, None)
         return
 
-    # RESTORED TP/SL: Perhitungan TP & SL baru berbasis execution_side
+    # Hitung level TP/SL ulang berbasis execution_side (setelah dibalik)
+    risk_profile = DynamicRiskManager.calculate_levels(price, execution_side, atr)
     tp_pct   = risk_profile["tp_pct"]
     sl_pct   = risk_profile["sl_pct"]
     tp_price = risk_profile["tp_price"]
     sl_price = risk_profile["sl_price"]
 
-    # TRAILING STOP REMOVED: Variabel trailing dihilangkan sepenuhnya
     pos = {
-        "side": execution_side,             # Disimpan berbasis execution_side (setelah reverse)
-        "orig_signal": orig_direction,      # Untuk tracking / log eksperimen
+        "side": execution_side,             # Disimpan berbasis arah eksekusi reverse
+        "orig_signal": orig_direction,      # Tracking sinyal asli
         "entry": price, "qty": q_val,
         "open_time": time.time(), "score": score, "sigs": sigs,
         "atr": atr, "regime": regime, "bias": bias,
@@ -910,7 +912,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     except Exception: pass
 
     try:
-        # Eksekusi order menggunakan execution_side (bukan orig_direction)
+        # Eksekusi posisi kebalikan (Reverse)
         order = client.futures_create_order(
             symbol=sym, side='BUY' if execution_side == 'LONG' else 'SELL',
             type='MARKET', quantity=q_val, newOrderRespType='RESULT'
@@ -918,7 +920,6 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         real_px = get_real_fill_price(sym, order)
         if real_px > 0:
             price = real_px
-            # Hitung ulang level TP/SL berbasis harga fill sesungguhnya dan execution_side
             new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
             with _lock:
                 if sym in live_positions:
@@ -932,13 +933,13 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
                     })
         print(f"         ✅ ORDER #{order.get('orderId')} | fill:{price:.6g} | qty:{q_val}")
     except Exception as e:
-        print(f"  ❌ ORDER GAGAL {sym}: {e}")
+        print(f"   ❌ ORDER GAGAL {sym}: {e}")
         with _lock: live_positions.pop(sym, None)
         return
 
     d = "🟢" if execution_side == "LONG" else "🔴"
     imb_str = f" | BAI:{order_book.get_imbalance(sym)*100:+.0f}%" if order_book.get_book(sym) else ""
-    print(f"\n  {d} [INVERTED-BACK ENGINE v22] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% (dulu SL) | SL:{sl_pct*100:.2f}% (dulu TP){imb_str} | Regime:{regime}")
+    print(f"\n  {d} [REVERSE-ENTRY ENGINE v22] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% | SL:{sl_pct*100:.2f}%{imb_str} | Regime:{regime}")
     print(f"         Signals: {' | '.join(sigs[:6])}")
     _stats["trades"] += 1
     if any("Absorb" in s for s in sigs):
@@ -1077,46 +1078,45 @@ def scan_one(sym):
         orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
         if orig_direction is None: return None
 
-        # KEBALIKAN MODE LOSS SAAT INI: execution mengikuti signal asli.
-        execution_side = orig_direction
+        # MODIFIKASI: Arah eksekusi dibalik untuk evaluasi filter Veto
+        execution_side = "SHORT" if orig_direction == "LONG" else "LONG"
 
         px_live = price_live(sym)
         if px_live == 0: return None
 
-        # Filter Veto dijalankan berbasis execution_side (arah aktual yang dieksekusi)
         # ── VETO FILTER 1: BTC Flash Crash / Pump Circuit Breaker ────────────
         btc_vetoed, btc_reason = btc_macro.check_veto(execution_side)
         if btc_vetoed:
             _stats["btc_breaker_veto"] += 1
-            print(f"  ⛔ [{sym}] {execution_side} VETOED by BTC Circuit Breaker: {btc_reason}")
+            print(f"   ⛔ [{sym}] {execution_side} VETOED by BTC Circuit Breaker: {btc_reason}")
             return None
 
         # ── VETO FILTER 2: Order Book Wall Detection ──────────────────────────
         has_wall, wall_type, wall_px, wall_qty, wall_mult = order_book.check_walls(sym, px_live, execution_side)
         if has_wall:
             _stats["wall_veto"] += 1
-            print(f"  ⛔ [{sym}] {execution_side} VETOED by {wall_type} @ {wall_px:.6g} (qty:{wall_qty:.1f}, {wall_mult:.1f}x avg depth)")
+            print(f"   ⛔ [{sym}] {execution_side} VETOED by {wall_type} @ {wall_px:.6g} (qty:{wall_qty:.1f}, {wall_mult:.1f}x avg depth)")
             return None
 
         # ── VETO FILTER 3: Spoofing & Liquidity Pull Detection ────────────────
         is_spoof, spoof_reason = order_book.detect_spoofing(sym, execution_side)
         if is_spoof:
             _stats["spoof_veto"] += 1
-            print(f"  ⛔ [{sym}] {execution_side} VETOED: Spoofing detected ({spoof_reason})")
+            print(f"   ⛔ [{sym}] {execution_side} VETOED: Spoofing detected ({spoof_reason})")
             return None
 
         # ── VETO FILTER 4: Order Book Imbalance Guard ─────────────────────────
         imb = order_book.get_imbalance(sym)
         if execution_side == "LONG" and imb < -0.40:
             _stats["wall_veto"] += 1
-            print(f"  ⛔ [{sym}] LONG VETOED: Heavy Ask Queue Imbalance ({imb*100:.0f}%)")
+            print(f"   ⛔ [{sym}] LONG VETOED: Heavy Ask Queue Imbalance ({imb*100:.0f}%)")
             return None
         elif execution_side == "SHORT" and imb > 0.40:
             _stats["wall_veto"] += 1
-            print(f"  ⛔ [{sym}] SHORT VETOED: Heavy Bid Queue Imbalance ({imb*100:.0f}%)")
+            print(f"   ⛔ [{sym}] SHORT VETOED: Heavy Bid Queue Imbalance ({imb*100:.0f}%)")
             return None
 
-        # ── Hitung Dynamic Risk Profile Berbasis Execution Side & REVERSED TP/SL ──
+        # Hitung Risk Profile berbasis execution_side
         risk_profile = DynamicRiskManager.calculate_levels(px_live, execution_side, atr_val)
 
         return (sym, orig_direction, score, sigs, px_live, atr_val, regime, bias, risk_profile)
