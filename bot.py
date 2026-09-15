@@ -80,8 +80,8 @@ ATR_SL_RESTORED_MULTIPLIER = 1.8
 
 MIN_TP_PCT        = 0.025
 MAX_TP_PCT        = 0.035
-MIN_SL_PCT        = 0.025
-MAX_SL_PCT        = 0.035
+MIN_SL_PCT        = 0.015
+MAX_SL_PCT        = 0.025
 MAX_HOLD_SECONDS  = 6120   # 3 Jam batas maksimal tahan posisi
 # ──────────────────────────────────────────────────────────────────────────
 
