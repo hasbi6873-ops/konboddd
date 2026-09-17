@@ -2,6 +2,7 @@ flask
 gunicorn
 python-dotenv
 python-binance
+websockets<14
 ta
 pandas
 requests
