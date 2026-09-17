@@ -62,6 +62,11 @@ MAX_POSITIONS = 3
 # Bisa diset lewat env PAPER_TRADE=True jika ingin mode simulasi tanpa order.
 PAPER_TRADE   = os.getenv("PAPER_TRADE", "false").lower() in ("true", "1")
 
+# ── LOGIKA TRADING: INVERT_SIGNALS ──────────────────────────────────────────
+# True: Membalik sinyal analisis (Signal LONG -> Eksekusi SHORT, Signal SHORT -> Eksekusi LONG)
+# Menembak pembalikan tren (Fading local tops & exhaustion) saat continuation sering fakeout.
+INVERT_SIGNALS = os.getenv("INVERT_SIGNALS", "true").lower() in ("true", "1")
+
 # Scanning & Concurrency
 SCAN_INTERVAL = 2.0
 MONITOR_INT   = 0.1
@@ -991,8 +996,11 @@ def get_real_fill_price(sym, order_resp):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
-    # Eksekusi searah dengan sinyal kuantitatif murni (TIDAK MEMBALIK ARAH)
-    execution_side = orig_direction
+    if INVERT_SIGNALS:
+        execution_side = "SHORT" if orig_direction == "LONG" else "LONG"
+    else:
+        execution_side = orig_direction
+
     if execution_side not in ("LONG", "SHORT"):
         return
 
@@ -1097,7 +1105,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
 
     d = "🟢" if execution_side == "LONG" else "🔴"
     imb_str = f" | BAI:{order_book.get_imbalance(sym)*100:+.0f}%" if order_book.get_book(sym) else ""
-    print(f"\n  {d} [SCALP v22.2 PRO] {sym} EXEC:{execution_side} @{price:.6g} | TP:{tp_pct*100:.2f}% | SL:{sl_pct*100:.2f}% | BEP-Trigger:{bep_pct*100:.2f}%{imb_str} | Regime:{regime}")
+    inv_str = " [INVERTED]" if INVERT_SIGNALS else ""
+    print(f"\n  {d} [SCALP v22.2 PRO]{inv_str} {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% | SL:{sl_pct*100:.2f}% | BEP-Trigger:{bep_pct*100:.2f}%{imb_str} | Regime:{regime}")
     print(f"         Signals: {' | '.join(sigs[:6])}")
     _stats["trades"] += 1
     if any("Absorb" in s for s in sigs):
@@ -1236,21 +1245,21 @@ def monitor_positions():
                 continue
 
         # ── 2. BREAK-EVEN PROTECTION (BEP) ─────────────────────────────────
-        # Saat profit mencapai >= 0.8x ATR, kunci SL ke Entry + Taker Fee (Risiko Jadi 0!)
+        # Saat profit mencapai >= 0.8x ATR, kunci SL ke Entry + Net Profit Buffer (Risiko 0 & Terjamin Net Win!)
         bep_thresh = pos.get("bep_pct", 0.008)
         if not pos.get("bep_activated", False):
             if side == "LONG" and px >= entry * (1 + bep_thresh):
-                new_sl = entry * 1.0012  # Kunci di Entry + 0.12% (menutup fee taker 0.10% bolak-balik)
+                new_sl = entry * 1.0025  # Kunci di Entry + 0.25% (menjamin profit bersih setelah fee 0.10% + slippage)
                 if new_sl > pos["sl_price"]:
                     pos["sl_price"] = new_sl
                     pos["bep_activated"] = True
-                    print(f"  🛡️ [BEP LOCK] {sym} LONG terkunci di @{new_sl:.6g} (px:{px:.6g}) — Risiko = 0!")
+                    print(f"  🛡️ [BEP LOCK] {sym} LONG terkunci di @{new_sl:.6g} (px:{px:.6g}) — Risiko = 0 & Net Profit!")
             elif side == "SHORT" and px <= entry * (1 - bep_thresh):
-                new_sl = entry * 0.9988
+                new_sl = entry * 0.9975  # Kunci di Entry - 0.25%
                 if new_sl < pos["sl_price"]:
                     pos["sl_price"] = new_sl
                     pos["bep_activated"] = True
-                    print(f"  🛡️ [BEP LOCK] {sym} SHORT terkunci di @{new_sl:.6g} (px:{px:.6g}) — Risiko = 0!")
+                    print(f"  🛡️ [BEP LOCK] {sym} SHORT terkunci di @{new_sl:.6g} (px:{px:.6g}) — Risiko = 0 & Net Profit!")
 
         # ── 3. DYNAMIC TRAILING STOP ───────────────────────────────────────
         # Saat profit mencapai >= 1.2x ATR, aktifkan trailing stop berjarak 0.6x ATR
@@ -1309,8 +1318,11 @@ def scan_one(sym):
         orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
         if orig_direction is None: return None
 
-        # Sinyal kuantitatif asli (TIDAK MEMBALIK ARAH)
-        execution_side = orig_direction
+        if INVERT_SIGNALS:
+            execution_side = "SHORT" if orig_direction == "LONG" else "LONG"
+        else:
+            execution_side = orig_direction
+
         if execution_side not in ("LONG", "SHORT"):
             return None
 
@@ -1394,8 +1406,9 @@ def print_full():
     bep = al / (al + aw) * 100 if (al + aw) > 0 else 50
 
     mode_str = "PAPER MODE" if PAPER_TRADE else "BINANCE LIVE/TESTNET"
+    inv_mode_str = " | INVERTED (FADING)" if INVERT_SIGNALS else " | DIRECT"
     print(f"\n  {'─'*72}")
-    print(f"    🔔 INSTITUTIONAL SCALPING v22.2 PRO DASHBOARD ({mode_str})")
+    print(f"    🔔 INSTITUTIONAL SCALPING v22.2 PRO DASHBOARD ({mode_str}{inv_mode_str})")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U | Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    📈 Exit Breakdown: TP:{_stats['tp_exit']} | BEP:{_stats['bep_exit']} | Trail:{_stats['trail_exit']} | SL:{_stats['hard_sl']} | TimeCut:{_stats['time_exit']}")
@@ -1615,8 +1628,10 @@ def t_ws_watchdog():
 def run_bot():
     mode_text = "PAPER TRADING (SIMULASI)" if PAPER_TRADE else "BINANCE LIVE/TESTNET (REAL ORDERS)"
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print(f"║  💎 BOT SCALPING v22.2 PRO — QUANTITATIVE MOMENTUM ENGINE          ║")
+    print(f"║  💎 BOT SCALPING v22.2 PRO — QUANTITATIVE SCALPING ENGINE          ║")
     print(f"║  Mode: {mode_text:<59} ║")
+    strat_text = "INVERTED (Fade Fakeouts / Local Tops)" if INVERT_SIGNALS else "DIRECT (Trend Continuation)"
+    print(f"║  Strategy: {strat_text:<55} ║")
     print("║  1. Win Rate > 60% Focus: EMA Stack + MACD + ADX + Taker Delta    ║")
     print("║  2. Dynamic Risk: TP 1.6x ATR | SL 1.1x ATR | BEP @ +0.8x ATR     ║")
     print("║  3. Trailing Stop @ +1.2x ATR | Momentum Invalidation (10-20m)     ║")
