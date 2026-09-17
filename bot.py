@@ -1,13 +1,14 @@
 """
-Bot Scalping v22.0 LIVE — INSTITUTIONAL QUANT ENGINE (Binance Futures)
-====================================================================
-MODIFIKASI PROFIT-INVERTED & HIGH WINRATE ENGINE:
-- Signal Asli LONG  -> Eksekusi SHORT
-- Signal Asli SHORT -> Eksekusi LONG
-- Jarak TP = 1.5x ATR (Realistis & Cepat Terjangkau)
-- Jarak SL = 2.2x ATR
-- Time Limit Lockdown: Mengunci Profit jika waktu habis saat posisi hijau.
-- WebSocket Auto-Reconnect & Emergency REST Close.
+Bot Scalping v22.2 PRO — QUANTITATIVE MOMENTUM & RECONCILIATION ENGINE (Binance Futures)
+========================================================================================
+FITUR UTAMA:
+- Probabilitas Tinggi (Target Win Rate > 60%): Konfluensi EMA Stack + MACD + ADX + Taker Order Flow Delta
+- Full Reconciliation Engine: Sinkronisasi real-time dengan posisi riil akun Binance
+- Break-Even Protection (BEP): Mengunci posisi ke titik BEP (+Fee) saat profit >= 0.8x ATR (Zero Risk)
+- Dynamic Volatility ATR TP & SL (TP: 1.6x ATR | SL: 1.1x ATR)
+- Dynamic Trailing Stop: Mengunci floating profit saat menyentuh >= 1.2x ATR
+- Time & Momentum Invalidation: Max hold 20 menit (cut loss dini jika momentum mati di 10 menit)
+- Resilient Data Feed: Fallback otomatis REST saat WebSocket sepi (BTC Macro selalu aktif, anti $0.0)
 """
 
 import sys
@@ -57,6 +58,9 @@ except Exception:
 LEVERAGE      = 20
 ORDER_USDT    = 2.0
 MAX_POSITIONS = 3
+# Default False agar order riil dikirim ke Binance Demo/Testnet sesuai akun user.
+# Bisa diset lewat env PAPER_TRADE=True jika ingin mode simulasi tanpa order.
+PAPER_TRADE   = os.getenv("PAPER_TRADE", "false").lower() in ("true", "1")
 
 # Scanning & Concurrency
 SCAN_INTERVAL = 2.0
@@ -64,22 +68,28 @@ MONITOR_INT   = 0.1
 BATCH_SIZE    = 15
 MAX_WORKERS   = 5
 SLOT_FILL_INT = 0.01
-COOLDOWN_SEC  = 300   # 5 Menit jeda per simbol setelah close
+COOLDOWN_SEC  = 180   # 3 Menit jeda per simbol setelah close
 
-# Scoring & Filter
-MIN_SCORE      = 55
+# Scoring & Filter Kuantitatif (Ambang Batas Ketat untuk Sinyal A-Grade)
+MIN_SCORE      = 65
 SLIPPAGE_GUARD = 0.0015
 TTL_5M         = 2
 
 # ── Dynamic Volatility Risk Management (ATR Multipliers) ───────────────────
-ATR_TP_MULTIPLIER = 1.5
-ATR_SL_MULTIPLIER = 2.2
+ATR_TP_MULTIPLIER       = 1.6   # TP pada 1.6x ATR (Target realistis yang dapat tercapai)
+ATR_SL_MULTIPLIER       = 1.1   # SL pada 1.1x ATR (Terkendali & simetris)
+ATR_BEP_TRIGGER         = 0.8   # BEP aktif saat profit mencapai 0.8x ATR (Lock SL ke Entry + Fee)
+ATR_TRAILING_TRIGGER    = 1.2   # Trailing aktif saat profit mencapai 1.2x ATR
+ATR_TRAILING_DIST       = 0.6   # Jarak trailing stop 0.6x ATR dari peak price
 
-MIN_TP_PCT        = 0.012
-MAX_TP_PCT        = 0.028
-MIN_SL_PCT        = 0.015
-MAX_SL_PCT        = 0.035
-MAX_HOLD_SECONDS  = 6120   # 3 Jam batas maksimal tahan posisi
+MIN_TP_PCT        = 0.008  # Minimal 0.8%
+MAX_TP_PCT        = 0.040  # Maksimal 4.0%
+MIN_SL_PCT        = 0.006  # Minimal 0.6%
+MAX_SL_PCT        = 0.025  # Maksimal 2.5%
+
+# Waktu Tahan Posisi: Scalping cepat, bukan menahan 1.7 jam!
+INVALIDATION_SECONDS = 600   # 10 Menit: Jika momentum mati dan PnL <= 0, exit dini
+MAX_HOLD_SECONDS     = 1200  # 20 Menit batas maksimal mutlak posisi scalping
 # ──────────────────────────────────────────────────────────────────────────
 
 # ── Institutional Microstructure (Order Book Depth) ───────────────────────
@@ -172,6 +182,10 @@ class OrderBookEngine:
         return book["imbalance"] if book else 0.0
 
     def check_walls(self, symbol: str, current_price: float, side: str) -> Tuple[bool, str, float, float, float]:
+        """
+        Deteksi apakah ada Limit Wall tebal yang menghalangi pergerakan harga.
+        Returns: (has_wall, wall_type, wall_price, wall_qty, wall_multiplier)
+        """
         book = self.get_book(symbol)
         if not book:
             return False, "NO_DATA", 0.0, 0.0, 0.0
@@ -203,6 +217,9 @@ class OrderBookEngine:
         return False, "OK", 0.0, 0.0, 0.0
 
     def detect_spoofing(self, symbol: str, side: str) -> Tuple[bool, str]:
+        """
+        Deteksi apakah ada penarikan likuiditas mendadak (spoofing trap).
+        """
         with self._lock:
             hist = list(self._history.get(symbol, []))
         if len(hist) < 3: return False, ""
@@ -297,6 +314,11 @@ _btc_macro = {"regime": "UNKNOWN", "m5": 0.0, "delta_ratio": 0.0, "cvd": 0.0}
 class AbsorptionDetector:
     @staticmethod
     def detect(df: pd.DataFrame) -> Tuple[bool, bool, str]:
+        """
+        Deteksi Institutional Absorption:
+        - Bullish: Seller volume meledak tapi harga tertahan di support/membuat lower wick panjang.
+        - Bearish: Buyer volume meledak tapi harga tertahan di resistance/membuat upper wick panjang.
+        """
         if df is None or len(df) < 25: return False, False, ""
         row = df.iloc[-2]
         
@@ -310,11 +332,13 @@ class AbsorptionDetector:
         lw_ratio = row.get("lower_wick_ratio", 0.0)
         uw_ratio = row.get("upper_wick_ratio", 0.0)
 
+        # Bullish Absorption
         heavy_seller = (delta_ratio < -0.20) or (buy_ratio < 0.40)
         wick_bull = lw_ratio >= 0.38
         close_held_bull = close >= (low + 0.45 * rng)
         bull_absorb = vol_spike and heavy_seller and (wick_bull or close_held_bull)
 
+        # Bearish Absorption
         heavy_buyer = (delta_ratio > 0.20) or (buy_ratio > 0.60)
         wick_bear = uw_ratio >= 0.38
         close_held_bear = close <= (high - 0.45 * rng)
@@ -329,7 +353,7 @@ class AbsorptionDetector:
         return bull_absorb, bear_absorb, " ".join(details)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  4. VOLATILITY-ADJUSTED RISK MANAGEMENT (PROFIT-ORIENTED)
+#  4. VOLATILITY-ADJUSTED RISK MANAGEMENT (PROFIT ENGINE + BEP + TRAILING)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class DynamicRiskManager:
@@ -337,8 +361,12 @@ class DynamicRiskManager:
     def calculate_levels(entry_price: float, execution_side: str, atr: float) -> Dict[str, float]:
         atr_pct = (atr / entry_price) if entry_price > 0 else 0.015
 
+        # Scalping Presisi: TP = 1.6x ATR, SL = 1.1x ATR (Risk-Reward Positif)
         tp_pct = max(MIN_TP_PCT, min(MAX_TP_PCT, ATR_TP_MULTIPLIER * atr_pct))
         sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, ATR_SL_MULTIPLIER * atr_pct))
+        bep_pct = ATR_BEP_TRIGGER * atr_pct
+        trail_pct = ATR_TRAILING_TRIGGER * atr_pct
+        trail_dist_pct = ATR_TRAILING_DIST * atr_pct
 
         if execution_side == "LONG":
             tp_price = entry_price * (1 + tp_pct)
@@ -352,6 +380,9 @@ class DynamicRiskManager:
             "sl_pct": sl_pct,
             "tp_price": tp_price,
             "sl_price": sl_price,
+            "bep_pct": bep_pct,
+            "trail_pct": trail_pct,
+            "trail_dist_pct": trail_dist_pct,
             "atr_pct": atr_pct
         }
 
@@ -362,7 +393,7 @@ class DynamicRiskManager:
 class MarketRegime:
     REGIME_TRENDING_BULL = "TRENDING_BULL"
     REGIME_TRENDING_BEAR = "TRENDING_BEAR"
-    REGIME_RANGE          = "RANGE"
+    REGIME_RANGE         = "RANGE"
     REGIME_VOLATILE      = "VOLATILE"
     REGIME_EXHAUSTION    = "EXHAUSTION"
 
@@ -376,8 +407,8 @@ class MarketRegime:
         adx = row["adx"]
         bull_stack = close > e5 > e9 > e21 > e50
         bear_stack = close < e5 < e9 < e21 < e50
-        mild_bull   = close > e9 > e21
-        mild_bear   = close < e9 < e21
+        mild_bull  = close > e9 > e21
+        mild_bear  = close < e9 < e21
         strong_trend      = adx > 25
         very_strong_trend = adx > 35
         atr_expand   = (atr / atr_prev) > 1.2 if atr_prev > 0 else False
@@ -626,7 +657,7 @@ _macro = {"btc": "UNKNOWN"}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0, "ath_pnl": 0.0,
-    "hard_sl": 0, "tp_exit": 0, "regime_block": 0,
+    "hard_sl": 0, "tp_exit": 0, "bep_exit": 0, "trail_exit": 0, "time_exit": 0, "regime_block": 0,
     "wall_veto": 0, "btc_breaker_veto": 0, "spoof_veto": 0, "absorb_entries": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
@@ -641,6 +672,7 @@ learning       = LearningLayer(signal_weights)
 _last_err_print   = defaultdict(float)
 _api_fail_streak = 0
 _api_ok_last      = time.time()
+_symbol_rules     = {}
 
 def _log_err(tag, e, cooldown=10):
     now = time.time()
@@ -666,22 +698,56 @@ def _api_fail(tag):
         idle = time.time() - _api_ok_last
         print(f"  🚨 API GAGAL BERUNTUN {_api_fail_streak}x (idle {idle:.0f}s) — trigger: {tag}")
 
-def get_precision(symbol):
-    if symbol in _precision_cache: return _precision_cache[symbol]
+def get_symbol_rules(symbol: str) -> Dict[str, Any]:
+    """Mengambil dan meng-cache aturan presisi, LOT_SIZE (stepSize, minQty), dan MIN_NOTIONAL dari Binance."""
+    if symbol in _symbol_rules: return _symbol_rules[symbol]
     try:
         info = client.futures_exchange_info()
-        for s in info['symbols']:
-            if s['symbol'] == symbol:
-                prec = int(s['quantityPrecision'])
-                _precision_cache[symbol] = prec
-                return prec
+        for s in info.get('symbols', []):
+            sym = s.get('symbol')
+            prec = int(s.get('quantityPrecision', 2))
+            step_size = 10 ** (-prec)
+            min_qty = step_size
+            min_notional = 5.0
+            for f in s.get('filters', []):
+                if f.get('filterType') == 'LOT_SIZE':
+                    step_size = float(f.get('stepSize', step_size))
+                    min_qty = float(f.get('minQty', min_qty))
+                elif f.get('filterType') in ('MIN_NOTIONAL', 'NOTIONAL'):
+                    min_notional = float(f.get('notional', f.get('minNotional', 5.0)))
+            _symbol_rules[sym] = {
+                "precision": prec,
+                "step_size": step_size,
+                "min_qty": min_qty,
+                "min_notional": min_notional
+            }
+        if symbol in _symbol_rules: return _symbol_rules[symbol]
     except Exception as e:
-        _log_err("get_precision", e)
-    return 2
+        _log_err("get_symbol_rules", e)
+    return {"precision": 2, "step_size": 0.01, "min_qty": 0.01, "min_notional": 5.0}
 
-def qty(symbol, price):
-    raw = (ORDER_USDT * LEVERAGE) / price
-    return round(raw, get_precision(symbol))
+def format_qty(symbol: str, raw_qty: float) -> float:
+    """Format quantity agar sesuai eksak dengan stepSize Binance (mencegah LOT_SIZE/Precision error)."""
+    rules = get_symbol_rules(symbol)
+    step = rules["step_size"]
+    prec = rules["precision"]
+    if step > 0:
+        rounded = math.floor(raw_qty / step) * step
+    else:
+        rounded = round(raw_qty, prec)
+    if prec == 0:
+        return float(int(rounded))
+    return float(f"{rounded:.{prec}f}")
+
+def qty(symbol: str, price: float) -> float:
+    if price <= 0: return 0.0
+    rules = get_symbol_rules(symbol)
+    target_notional = max(ORDER_USDT * LEVERAGE, rules["min_notional"] * 1.05)
+    raw = target_notional / price
+    q = format_qty(symbol, raw)
+    if q < rules["min_qty"]:
+        q = rules["min_qty"]
+    return q
 
 def price_live(symbol):
     cached = _ws_mark_price.get(symbol)
@@ -698,6 +764,83 @@ def price_live(symbol):
         _log_err(f"price_live_{symbol}", e)
         _api_fail(f"price_live_{symbol}")
         return 0.0
+
+def sync_binance_positions():
+    """
+    RECONCILIATION ENGINE:
+    Mencegah bug posisi ganda / siluman di Binance Demo.
+    Membaca posisi riil di akun Binance Futures dan menyinkronkannya dengan memory bot.
+    """
+    if PAPER_TRADE or not api_key or not api_secret:
+        return
+    try:
+        raw_pos = client.futures_position_information()
+        _api_ok()
+        active = [p for p in raw_pos if abs(float(p.get("positionAmt", 0))) > 1e-6]
+        active_syms = set()
+
+        with _lock:
+            for p in active:
+                sym = p["symbol"]
+                amt = float(p["positionAmt"])
+                entry_px = float(p.get("entryPrice", 0))
+                side = "LONG" if amt > 0 else "SHORT"
+                abs_qty = abs(amt)
+                active_syms.add(sym)
+
+                if sym not in live_positions or live_positions[sym].get("_r"):
+                    # Posisi aktif di Binance tapi tidak terpantau di bot (misal akibat restart/order sisa)
+                    px_curr = price_live(sym) or entry_px
+                    df = _kline_cache.get(sym)
+                    atr_val = df["atr"].iloc[-2] if (df is not None and "atr" in df.columns) else (px_curr * 0.015)
+                    risk = DynamicRiskManager.calculate_levels(entry_px if entry_px > 0 else px_curr, side, atr_val)
+
+                    live_positions[sym] = {
+                        "side": side,
+                        "orig_signal": side,
+                        "entry": entry_px if entry_px > 0 else px_curr,
+                        "qty": abs_qty,
+                        "open_time": time.time(),
+                        "score": 75,
+                        "sigs": ["BINANCE_RECONCILED"],
+                        "atr": atr_val,
+                        "regime": "SYNCED",
+                        "bias": 0.0,
+                        "tp_pct": risk["tp_pct"],
+                        "sl_pct": risk["sl_pct"],
+                        "tp_price": risk["tp_price"],
+                        "sl_price": risk["sl_price"],
+                        "bep_pct": risk["bep_pct"],
+                        "trail_pct": risk["trail_pct"],
+                        "trail_dist_pct": risk["trail_dist_pct"],
+                        "bep_activated": False,
+                        "trailing_active": False,
+                        "trailing_sl": risk["sl_price"],
+                        "peak_price": px_curr
+                    }
+                    print(f"  🔄 [RECONCILE] Posisi riil Binance terdeteksi & disinkron: {sym} {side} amt:{abs_qty} @{entry_px:.6g}")
+                else:
+                    # Update quantity agar sesuai dengan matching engine Binance
+                    live_positions[sym]["qty"] = abs_qty
+                    if entry_px > 0 and live_positions[sym].get("entry", 0) == 0:
+                        live_positions[sym]["entry"] = entry_px
+
+            # Hapus posisi dari memory bot jika sudah tertutup di Binance
+            for sym in list(live_positions.keys()):
+                if not live_positions[sym].get("_r") and sym not in active_syms:
+                    print(f"  ℹ️ [RECONCILE] Posisi {sym} sudah tertutup di Binance -> Bersihkan dari tracking bot")
+                    live_positions.pop(sym, None)
+    except Exception as e:
+        _log_err("sync_binance_positions", e, cooldown=15)
+
+def t_position_reconciler():
+    """Background loop rekonsiliasi akun setiap 10 detik."""
+    while True:
+        try:
+            sync_binance_positions()
+        except Exception as e:
+            _log_err("t_position_reconciler", e)
+        time.sleep(10)
 
 def tickers_all():
     global _ticker_cache, _ticker_ts
@@ -848,12 +991,9 @@ def get_real_fill_price(sym, order_resp):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
-    # MEMBALIK SINYAL ASLI AGAR PROFIT KONSISTEN
-    if orig_direction == "LONG":
-        execution_side = "SHORT"
-    elif orig_direction == "SHORT":
-        execution_side = "LONG"
-    else:
+    # Eksekusi searah dengan sinyal kuantitatif murni (TIDAK MEMBALIK ARAH)
+    execution_side = orig_direction
+    if execution_side not in ("LONG", "SHORT"):
         return
 
     with _lock:
@@ -861,109 +1001,173 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         live_positions[sym] = {"_r": True}
 
     px_now = price_live(sym)
-    if px_now > 0: price = px_now
+    if px_now > 0:
+        price = px_now
 
     try: q_val = qty(sym, price)
     except: 
         with _lock: live_positions.pop(sym, None)
         return
 
-    new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
-    
+    tp_pct         = risk_profile["tp_pct"]
+    sl_pct         = risk_profile["sl_pct"]
+    tp_price       = risk_profile["tp_price"]
+    sl_price       = risk_profile["sl_price"]
+    bep_pct        = risk_profile.get("bep_pct", 0.008)
+    trail_pct      = risk_profile.get("trail_pct", 0.012)
+    trail_dist_pct = risk_profile.get("trail_dist_pct", 0.006)
+
     pos = {
         "side": execution_side,
         "orig_signal": orig_direction,
         "entry": price, "qty": q_val,
         "open_time": time.time(), "score": score, "sigs": sigs,
         "atr": atr, "regime": regime, "bias": bias,
-        "tp_pct": new_risk["tp_pct"], "sl_pct": new_risk["sl_pct"],
-        "tp_price": new_risk["tp_price"], "sl_price": new_risk["sl_price"],
+        "tp_pct": tp_pct, "sl_pct": sl_pct,
+        "tp_price": tp_price, "sl_price": sl_price,
+        "bep_pct": bep_pct, "trail_pct": trail_pct, "trail_dist_pct": trail_dist_pct,
+        "bep_activated": False,
+        "trailing_active": False,
+        "trailing_sl": sl_price,
         "peak_price": price
     }
     with _lock: live_positions[sym] = pos
 
-    try: client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
-    except Exception: pass
+    if PAPER_TRADE:
+        order = {"orderId": "PAPER"}
+        new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
+        with _lock:
+            if sym in live_positions:
+                live_positions[sym].update({
+                    "entry": price,
+                    "tp_pct": new_risk["tp_pct"],
+                    "sl_pct": new_risk["sl_pct"],
+                    "tp_price": new_risk["tp_price"],
+                    "sl_price": new_risk["sl_price"],
+                    "bep_pct": new_risk["bep_pct"],
+                    "trail_pct": new_risk["trail_pct"],
+                    "trail_dist_pct": new_risk["trail_dist_pct"],
+                    "trailing_sl": new_risk["sl_price"],
+                    "peak_price": price
+                })
+        print(f"         📝 PAPER ENTRY | fill:{price:.6g} | qty:{q_val}")
+    else:
+        try: client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
+        except Exception: pass
 
-    try:
-        order = client.futures_create_order(
-            symbol=sym, side='BUY' if execution_side == 'LONG' else 'SELL',
-            type='MARKET', quantity=q_val, newOrderRespType='RESULT'
-        )
-        real_px = get_real_fill_price(sym, order)
-        if real_px > 0:
-            price = real_px
-            new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
-            with _lock:
-                if sym in live_positions:
-                    live_positions[sym].update({
-                        'entry': price,
-                        'tp_price': new_risk["tp_price"],
-                        'sl_price': new_risk["sl_price"],
-                        'peak_price': price
-                    })
-        print(f"         ✅ ORDER REVERSE #{order.get('orderId')} | fill:{price:.6g} | qty:{q_val}")
-    except Exception as e:
-        print(f"   ❌ ORDER GAGAL {sym}: {e}")
-        with _lock: live_positions.pop(sym, None)
-        return
+        try:
+            order = client.futures_create_order(
+                symbol=sym, side='BUY' if execution_side == 'LONG' else 'SELL',
+                type='MARKET', quantity=q_val, newOrderRespType='RESULT'
+            )
+            real_px = get_real_fill_price(sym, order)
+            if real_px > 0:
+                price = real_px
+                new_risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
+                with _lock:
+                    if sym in live_positions:
+                        live_positions[sym].update({
+                            "entry": price,
+                            "tp_pct": new_risk["tp_pct"],
+                            "sl_pct": new_risk["sl_pct"],
+                            "tp_price": new_risk["tp_price"],
+                            "sl_price": new_risk["sl_price"],
+                            "bep_pct": new_risk["bep_pct"],
+                            "trail_pct": new_risk["trail_pct"],
+                            "trail_dist_pct": new_risk["trail_dist_pct"],
+                            "trailing_sl": new_risk["sl_price"],
+                            "peak_price": price
+                        })
+            print(f"         ✅ ORDER #{order.get('orderId')} | fill:{price:.6g} | qty:{q_val}")
+        except Exception as e:
+            print(f"  ❌ ORDER ERROR {sym}: {e}")
+            # Verifikasi apakah order sebenarnya terisi di Binance sebelum menghapus slot
+            try:
+                pos_info = client.futures_position_information(symbol=sym)
+                amt = float(pos_info[0].get("positionAmt", 0)) if pos_info else 0.0
+                if abs(amt) > 1e-6:
+                    print(f"  ℹ️ [ORDER RECOVERY] {sym} berhasil terisi di Binance (amt={amt}). Mempertahankan posisi!")
+                    with _lock:
+                        if sym in live_positions: live_positions[sym]["qty"] = abs(amt)
+                    return
+            except Exception:
+                pass
+            with _lock: live_positions.pop(sym, None)
+            return
 
     d = "🟢" if execution_side == "LONG" else "🔴"
-    print(f"\n  {d} [PROFIT ENGINE v22] {sym} EXEC:{execution_side} (Orig:{orig_direction}) @{price:.6g} | TP:{new_risk['tp_pct']*100:.2f}% | SL:{new_risk['sl_pct']*100:.2f}%")
+    imb_str = f" | BAI:{order_book.get_imbalance(sym)*100:+.0f}%" if order_book.get_book(sym) else ""
+    print(f"\n  {d} [SCALP v22.2 PRO] {sym} EXEC:{execution_side} @{price:.6g} | TP:{tp_pct*100:.2f}% | SL:{sl_pct*100:.2f}% | BEP-Trigger:{bep_pct*100:.2f}%{imb_str} | Regime:{regime}")
+    print(f"         Signals: {' | '.join(sigs[:6])}")
+    _stats["trades"] += 1
+    if any("Absorb" in s for s in sigs):
+        _stats["absorb_entries"] += 1
 
 def live_close(sym, reason, price=None):
     with _lock:
-        pos = live_positions.get(sym)
+        pos = live_positions.pop(sym, None)
     if pos is None or pos.get("_r"): return
 
-    if price is None or price == 0:
+    if price is None:
         price = price_live(sym)
-        if price == 0:
-            try:
-                price = float(client.futures_symbol_ticker(symbol=sym)["price"])
-            except Exception:
-                price = pos["entry"]
 
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
 
-    try:
-        close_order = client.futures_create_order(
-            symbol=sym, side='SELL' if side == 'LONG' else 'BUY',
-            type='MARKET', quantity=q_val, reduceOnly=True, newOrderRespType='RESULT'
-        )
-        _api_ok()
-        real_px = get_real_fill_price(sym, close_order)
-        if real_px > 0: price = real_px
-        print(f"         ✅ SUCCESS CLOSE #{close_order.get('orderId')} | fill:{price:.6g}")
-    except Exception as e:
-        _log_err(f"close_order_{sym}", e, cooldown=2)
+    if PAPER_TRADE:
+        if price <= 0:
+            price = entry
+        print(f"         📝 PAPER CLOSE | fill:{price:.6g}")
+    else:
         try:
-            client.futures_create_order(symbol=sym, side='SELL' if side == 'LONG' else 'BUY', type='MARKET', quantity=q_val)
-        except Exception: pass
+            # Pastikan quantity diformat ulang sesuai rules Binance
+            close_qty = format_qty(sym, q_val)
+            close_order = client.futures_create_order(
+                symbol=sym, side='SELL' if side == 'LONG' else 'BUY',
+                type='MARKET', quantity=close_qty, reduceOnly=True, newOrderRespType='RESULT'
+            )
+            _api_ok()
+            real_px = get_real_fill_price(sym, close_order)
+            if real_px > 0:
+                price = real_px
+            elif price == 0:
+                print(f"  ⚠️ {sym}: close terkirim tapi harga fill 0 — estimasi pakai entry")
+                price = entry
+            print(f"         ✅ CLOSE ORDER #{close_order.get('orderId')} | fill:{price:.6g}")
+        except Exception as e:
+            _log_err(f"close_order_{sym}", e, cooldown=5)
+            print(f"  ⚠️ CLOSE ORDER GAGAL {sym}: {e}")
+            with _lock: live_positions[sym] = pos
+            return
 
-    with _lock: live_positions.pop(sym, None)
+    gross_pnl  = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
+    fee_rate   = 0.0005
+    total_fee  = (entry * q_val + price * q_val) * fee_rate
+    pnl        = gross_pnl - total_fee
+    pct        = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
+    hold       = time.time() - pos["open_time"]
+    won        = pnl >= 0
+    e_icon     = "🟢" if won else "🔴"
 
-    gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
-    total_fee = (entry * q_val + price * q_val) * 0.0005
-    pnl = gross_pnl - total_fee
-    pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
-    hold = time.time() - pos["open_time"]
-    won = pnl >= 0
-    e_icon = "🟢" if won else "🔴"
+    peak_px  = pos.get("peak_price", entry)
+    peak_pct = (peak_px - entry) / entry if side == "LONG" else (entry - peak_px) / entry
 
-    print(f"  {e_icon} [PROFIT ENGINE v22] {sym} {side} CLOSE — {reason} | PnL:{pnl:+.5f}U")
+    print(f"  {e_icon} [SCALP v22.2 PRO] {sym} {side} CLOSE — {reason} | peak:{peak_pct*100:+.3f}%")
+    print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
 
     trade = TradeRecord(
         symbol=sym, direction=side, entry_price=entry, exit_price=price,
         pnl=pnl, won=won, regime=pos.get("regime", "UNKNOWN"),
         signals=pos.get("sigs", []), score=pos.get("score", 0),
-        atr_entry=pos.get("atr", 0), hold_seconds=hold, exit_reason=reason, peak_pct=0.0
+        atr_entry=pos.get("atr", 0), hold_seconds=hold, exit_reason=reason, peak_pct=peak_pct,
     )
     learning.add_trade(trade)
 
     _stats["pnl"] += pnl
     _stats["hist"].append(pnl)
-    if _stats["pnl"] > _stats["ath_pnl"]: _stats["ath_pnl"] = _stats["pnl"]
+    
+    if _stats["pnl"] > _stats["ath_pnl"]:
+        _stats["ath_pnl"] = _stats["pnl"]
+
     ks_upd(pnl)
 
     if won:
@@ -973,8 +1177,11 @@ def live_close(sym, reason, price=None):
         _stats["losses"] += 1
         if pnl < _stats["worst"]: _stats["worst"] = pnl
 
-    if "SL" in reason: _stats["hard_sl"] += 1
+    if "BEP" in reason: _stats["bep_exit"] += 1
+    elif "TRAIL" in reason: _stats["trail_exit"] += 1
     elif "TP" in reason: _stats["tp_exit"] += 1
+    elif "SL" in reason: _stats["hard_sl"] += 1
+    elif "TIME" in reason or "INVALIDATION" in reason: _stats["time_exit"] += 1
 
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7), "exit": round(price, 7),
@@ -992,28 +1199,99 @@ def monitor_positions():
         if pos is None or pos.get("_r"): continue
 
         hold_time = time.time() - pos["open_time"]
+        side, entry = pos["side"], pos["entry"]
+        tp_px, sl_px = pos["tp_price"], pos["sl_price"]
+
         px = price_live(sym)
-        if px == 0: continue
-
-        side, entry, tp_px, sl_px = pos["side"], pos["entry"], pos["tp_price"], pos["sl_price"]
-        current_pnl_pct = (px - entry) / entry if side == "LONG" else (entry - px) / entry
-
-        # KUNCI PROFIT PADA TIME LIMIT: Jika lebih dari 3 jam & posisi PROFIT > +0.1%, langsung AMANKAN!
-        if hold_time > MAX_HOLD_SECONDS:
-            if current_pnl_pct > 0.001:
-                print(f"  🟢 {sym}: TIME_LIMIT dicapai dalam posisi PROFIT ({current_pnl_pct*100:+.2f}%) — Take Profit!")
-                live_close(sym, "TIME_LIMIT_PROFIT", px)
-            else:
-                print(f"  ⏰ {sym}: TIME_LIMIT dicapai ({hold_time:.0f}s) — Cut Loss / Close")
-                live_close(sym, "TIME_LIMIT", px)
+        if px == 0:
+            pos["_fail_count"] = pos.get("_fail_count", 0) + 1
+            fc = pos["_fail_count"]
+            if fc in (5, 20, 60) or fc % 300 == 0:
+                print(f"  ⚠️ {sym}: price_live gagal {fc}x — SL/TP monitoring tertunda")
             continue
+        pos["_fail_count"] = 0
 
+        # Update peak price
         if side == "LONG":
-            if px >= tp_px: live_close(sym, "TP", tp_px); continue
-            if px <= sl_px: live_close(sym, "SL", sl_px); continue
+            if px > pos.get("peak_price", entry): pos["peak_price"] = px
+        else:
+            if px < pos.get("peak_price", entry): pos["peak_price"] = px
+
+        # ── 1. HARD TP & SL HIT CHECK ──────────────────────────────────────
+        if side == "LONG":
+            if px >= tp_px:
+                live_close(sym, "TP", tp_px)
+                continue
+            if px <= sl_px:
+                reason = "BEP_SL" if pos.get("bep_activated") else ("TRAIL_SL" if pos.get("trailing_active") else "SL")
+                live_close(sym, reason, sl_px)
+                continue
         elif side == "SHORT":
-            if px <= tp_px: live_close(sym, "TP", tp_px); continue
-            if px >= sl_px: live_close(sym, "SL", sl_px); continue
+            if px <= tp_px:
+                live_close(sym, "TP", tp_px)
+                continue
+            if px >= sl_px:
+                reason = "BEP_SL" if pos.get("bep_activated") else ("TRAIL_SL" if pos.get("trailing_active") else "SL")
+                live_close(sym, reason, sl_px)
+                continue
+
+        # ── 2. BREAK-EVEN PROTECTION (BEP) ─────────────────────────────────
+        # Saat profit mencapai >= 0.8x ATR, kunci SL ke Entry + Taker Fee (Risiko Jadi 0!)
+        bep_thresh = pos.get("bep_pct", 0.008)
+        if not pos.get("bep_activated", False):
+            if side == "LONG" and px >= entry * (1 + bep_thresh):
+                new_sl = entry * 1.0012  # Kunci di Entry + 0.12% (menutup fee taker 0.10% bolak-balik)
+                if new_sl > pos["sl_price"]:
+                    pos["sl_price"] = new_sl
+                    pos["bep_activated"] = True
+                    print(f"  🛡️ [BEP LOCK] {sym} LONG terkunci di @{new_sl:.6g} (px:{px:.6g}) — Risiko = 0!")
+            elif side == "SHORT" and px <= entry * (1 - bep_thresh):
+                new_sl = entry * 0.9988
+                if new_sl < pos["sl_price"]:
+                    pos["sl_price"] = new_sl
+                    pos["bep_activated"] = True
+                    print(f"  🛡️ [BEP LOCK] {sym} SHORT terkunci di @{new_sl:.6g} (px:{px:.6g}) — Risiko = 0!")
+
+        # ── 3. DYNAMIC TRAILING STOP ───────────────────────────────────────
+        # Saat profit mencapai >= 1.2x ATR, aktifkan trailing stop berjarak 0.6x ATR
+        trail_thresh = pos.get("trail_pct", 0.012)
+        trail_dist = pos.get("trail_dist_pct", 0.006)
+        if side == "LONG":
+            if px >= entry * (1 + trail_thresh):
+                pos["trailing_active"] = True
+            if pos.get("trailing_active", False):
+                trail_stop = px * (1 - trail_dist)
+                if trail_stop > pos["sl_price"]:
+                    pos["sl_price"] = trail_stop
+                    pos["trailing_sl"] = trail_stop
+        elif side == "SHORT":
+            if px <= entry * (1 - trail_thresh):
+                pos["trailing_active"] = True
+            if pos.get("trailing_active", False):
+                trail_stop = px * (1 + trail_dist)
+                if trail_stop < pos["sl_price"]:
+                    pos["sl_price"] = trail_stop
+                    pos["trailing_sl"] = trail_stop
+
+        # ── 4. MOMENTUM DECAY & INVALIDATION (Exit Cepat jika Momentum Mati) ──
+        # Jika sudah tahan >= 10 menit (600s) dan trade jalan di tempat/minus serta momentum berbalik
+        cur_pnl_pct = (px - entry) / entry if side == "LONG" else (entry - px) / entry
+        if hold_time > INVALIDATION_SECONDS:
+            df = _kline_cache.get(sym)
+            if df is not None and len(df) >= 5:
+                last_m5 = df["m5"].iloc[-2]
+                if (side == "LONG" and last_m5 < -0.002 and cur_pnl_pct <= 0) or \
+                   (side == "SHORT" and last_m5 > 0.002 and cur_pnl_pct <= 0):
+                    print(f"  ⚡ {sym}: Momentum mati & arah berbalik ({hold_time:.0f}s) — MOMENTUM_INVALIDATION close")
+                    live_close(sym, "MOMENTUM_INVALIDATION", px)
+                    continue
+
+        # ── 5. MAX TIME LIMIT (20 Menit Maksimal) ──────────────────────────
+        if hold_time > MAX_HOLD_SECONDS:
+            reason = "TIME_LIMIT_PROFIT" if cur_pnl_pct > 0 else "TIME_LIMIT_CUT"
+            print(f"  ⏰ {sym}: MAX_HOLD_SECONDS tercapai ({hold_time:.0f}s, PnL:{cur_pnl_pct*100:+.2f}%) — {reason}")
+            live_close(sym, reason, px)
+            continue
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  6. SCANNER THREAD & HARD VETO FILTERS
@@ -1031,39 +1309,48 @@ def scan_one(sym):
         orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
         if orig_direction is None: return None
 
-        execution_side = "SHORT" if orig_direction == "LONG" else "LONG"
+        # Sinyal kuantitatif asli (TIDAK MEMBALIK ARAH)
+        execution_side = orig_direction
+        if execution_side not in ("LONG", "SHORT"):
+            return None
 
         px_live = price_live(sym)
         if px_live == 0: return None
 
+        # Filter Veto dijalankan berbasis execution_side (arah aktual yang dieksekusi)
+        # ── VETO FILTER 1: BTC Flash Crash / Pump Circuit Breaker ────────────
         btc_vetoed, btc_reason = btc_macro.check_veto(execution_side)
         if btc_vetoed:
             _stats["btc_breaker_veto"] += 1
-            print(f"   ⛔ [{sym}] {execution_side} VETOED by BTC Circuit Breaker: {btc_reason}")
+            print(f"  ⛔ [{sym}] {execution_side} VETOED by BTC Circuit Breaker: {btc_reason}")
             return None
 
+        # ── VETO FILTER 2: Order Book Wall Detection ──────────────────────────
         has_wall, wall_type, wall_px, wall_qty, wall_mult = order_book.check_walls(sym, px_live, execution_side)
         if has_wall:
             _stats["wall_veto"] += 1
-            print(f"   ⛔ [{sym}] {execution_side} VETOED by {wall_type} @ {wall_px:.6g} (qty:{wall_qty:.1f}, {wall_mult:.1f}x avg depth)")
+            print(f"  ⛔ [{sym}] {execution_side} VETOED by {wall_type} @ {wall_px:.6g} (qty:{wall_qty:.1f}, {wall_mult:.1f}x avg depth)")
             return None
 
+        # ── VETO FILTER 3: Spoofing & Liquidity Pull Detection ────────────────
         is_spoof, spoof_reason = order_book.detect_spoofing(sym, execution_side)
         if is_spoof:
             _stats["spoof_veto"] += 1
-            print(f"   ⛔ [{sym}] {execution_side} VETOED: Spoofing detected ({spoof_reason})")
+            print(f"  ⛔ [{sym}] {execution_side} VETOED: Spoofing detected ({spoof_reason})")
             return None
 
+        # ── VETO FILTER 4: Order Book Imbalance Guard ─────────────────────────
         imb = order_book.get_imbalance(sym)
         if execution_side == "LONG" and imb < -0.40:
             _stats["wall_veto"] += 1
-            print(f"   ⛔ [{sym}] LONG VETOED: Heavy Ask Queue Imbalance ({imb*100:.0f}%)")
+            print(f"  ⛔ [{sym}] LONG VETOED: Heavy Ask Queue Imbalance ({imb*100:.0f}%)")
             return None
         elif execution_side == "SHORT" and imb > 0.40:
             _stats["wall_veto"] += 1
-            print(f"   ⛔ [{sym}] SHORT VETOED: Heavy Bid Queue Imbalance ({imb*100:.0f}%)")
+            print(f"  ⛔ [{sym}] SHORT VETOED: Heavy Bid Queue Imbalance ({imb*100:.0f}%)")
             return None
 
+        # ── Hitung Dynamic Risk Profile Berbasis Execution Side & REVERSED TP/SL ──
         risk_profile = DynamicRiskManager.calculate_levels(px_live, execution_side, atr_val)
 
         return (sym, orig_direction, score, sigs, px_live, atr_val, regime, bias, risk_profile)
@@ -1093,8 +1380,8 @@ def print_inline():
     aw = learning.avg_win()
     avg_pk = learning.avg_peak_win()
     e = "💚" if pnl >= 0 else "🔴"
-    print(f"       ┌ [PROFIT ENGINE v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
-    print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Absorb:{_stats['absorb_entries']} | AvgWin:{aw:+.4f}U")
+    print(f"       ┌ [SCALP v22.2 PRO] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
+    print(f"       └ TP:{_stats['tp_exit']} BEP:{_stats['bep_exit']} Trail:{_stats['trail_exit']} SL:{_stats['hard_sl']} Cut:{_stats['time_exit']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -1106,16 +1393,17 @@ def print_full():
     aw, al = learning.avg_win(), learning.avg_loss()
     bep = al / (al + aw) * 100 if (al + aw) > 0 else 50
 
+    mode_str = "PAPER MODE" if PAPER_TRADE else "BINANCE LIVE/TESTNET"
     print(f"\n  {'─'*72}")
-    print(f"    🔔 INSTITUTIONAL SCALPING v22 LIVE DASHBOARD (PROFIT ENGINE MODE)")
+    print(f"    🔔 INSTITUTIONAL SCALPING v22.2 PRO DASHBOARD ({mode_str})")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U | Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']}")
+    print(f"    📈 Exit Breakdown: TP:{_stats['tp_exit']} | BEP:{_stats['bep_exit']} | Trail:{_stats['trail_exit']} | SL:{_stats['hard_sl']} | TimeCut:{_stats['time_exit']}")
     print(f"    🛡️ Veto Stats: Wall Veto:{_stats['wall_veto']} | BTC Breaker:{_stats['btc_breaker_veto']} | Spoof:{_stats['spoof_veto']}")
-    print(f"    ⚡ Absorption Entries: {_stats['absorb_entries']} | BEP WR:{bep:.1f}%")
+    print(f"    ⚡ Absorption Entries: {_stats['absorb_entries']} | BEP WR Target:{bep:.1f}%")
 
     if trade_log:
-        print(f"    {'─'*62}\n    📋 Last 5:")
+        print(f"    {'─'*62}\n    📋 Last 5 Trades:")
         for t in trade_log[-5:]:
             em = "🟢" if t["pnl"] > 0 else "🔴"
             print(f"       {em} {t['sym']:<16} {t['side']} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
@@ -1188,6 +1476,14 @@ def t_rescan(syms):
 def t_macro():
     while True:
         try:
+            # Fallback REST berkala agar harga btc_macro selalu segar dan tidak pernah $0.0
+            try:
+                btc_tick = client.futures_symbol_ticker(symbol="BTCUSDT")
+                if btc_tick and "price" in btc_tick:
+                    btc_macro.update_tick(float(btc_tick["price"]))
+            except Exception:
+                pass
+
             df_btc = ohlcv("BTCUSDT", Client.KLINE_INTERVAL_5MINUTE, 80)
             if df_btc is not None and len(df_btc) >= 55:
                 regime, strength, bias = MarketRegime.detect(df_btc)
@@ -1199,10 +1495,10 @@ def t_macro():
                 _btc_macro["cvd"] = row.get("cvd", 0.0)
         except Exception as e:
             _log_err("t_macro", e)
-        time.sleep(10)
+        time.sleep(5)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  7. WEBSOCKET HANDLERS & AUTO-RECONNECT WATCHDOG
+#  7. WEBSOCKET HANDLERS & WATCHDOG
 # ═══════════════════════════════════════════════════════════════════════════
 
 def handle_all_ticker(msg):
@@ -1306,26 +1602,10 @@ def bootstrap_all_klines(syms):
     print(f"  ✅ Bootstrap selesai: {ok}/{len(syms)} simbol siap dipantau")
 
 def t_ws_watchdog():
-    global twm
     while True:
         idle = time.time() - _ws_last_msg_ts
         if idle > WS_STALE_SEC:
-            print(f"  🚨 WEBSOCKET CRASHED/STALE ({idle:.0f}s). Initiating Auto-Reconnect...")
-            try:
-                twm.stop()
-                time.sleep(2)
-                twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret, testnet=True)
-                twm.start()
-                twm.start_all_mark_price_socket(callback=handle_mark_price, fast=True)
-                twm.start_futures_multiplex_socket(callback=handle_all_ticker, streams=["!ticker@arr"])
-                kline_streams = [f"{s.lower()}@kline_5m" for s in SYMBOLS]
-                twm.start_futures_multiplex_socket(callback=handle_kline_multiplex, streams=kline_streams)
-                twm.start_futures_multiplex_socket(callback=handle_btc_aggtrade, streams=["btcusdt@aggtrade"])
-                depth_streams = [f"{s.lower()}@depth10" for s in SYMBOLS]
-                twm.start_futures_multiplex_socket(callback=handle_depth_multiplex, streams=depth_streams)
-                print("  ✅ WebSocket Reconnected Successfully!")
-            except Exception as e:
-                print(f"  ⚠️ WebSocket Reconnect Failed: {e}")
+            print(f"  🚨 WEBSOCKET DIAM {idle:.0f}s — tidak ada data masuk. Fallback otomatis ke REST aktif.")
         time.sleep(10)
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1333,13 +1613,28 @@ def t_ws_watchdog():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_bot():
+    mode_text = "PAPER TRADING (SIMULASI)" if PAPER_TRADE else "BINANCE LIVE/TESTNET (REAL ORDERS)"
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  💎 BOT SCALPING v22.0 LIVE — PROFIT INVERTED QUANT ENGINE       ║")
-    print("║  1. Signal LONG  -> Execute SHORT | Signal SHORT -> Execute LONG   ║")
-    print("║  2. Dynamic Risk: TP 1.5x ATR | SL 2.2x ATR                        ║")
-    print("║  3. Time-Limit Lockdown Enabled (Auto Take Profit on Time Limit)  ║")
-    print("║  4. Resilient Auto-Reconnect WS Protection Active                 ║")
+    print(f"║  💎 BOT SCALPING v22.2 PRO — QUANTITATIVE MOMENTUM ENGINE          ║")
+    print(f"║  Mode: {mode_text:<59} ║")
+    print("║  1. Win Rate > 60% Focus: EMA Stack + MACD + ADX + Taker Delta    ║")
+    print("║  2. Dynamic Risk: TP 1.6x ATR | SL 1.1x ATR | BEP @ +0.8x ATR     ║")
+    print("║  3. Trailing Stop @ +1.2x ATR | Momentum Invalidation (10-20m)     ║")
+    print("║  4. Binance Reconciliation: Auto-Sync Akun Real-time (Anti-Ghost)  ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
+    
+    # Prime harga BTC awal via REST
+    try:
+        btc_tick = client.futures_symbol_ticker(symbol="BTCUSDT")
+        if btc_tick and "price" in btc_tick:
+            btc_macro.update_tick(float(btc_tick["price"]))
+            print(f"  ⚡ BTC Macro terinisialisasi @ ${float(btc_tick['price']):.1f}")
+    except Exception as e:
+        _log_err("btc_prime", e)
+
+    # Sinkronisasi posisi riil Binance saat startup
+    sync_binance_positions()
+
     try: valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
     except: valid = set(SYMBOLS)
     syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
@@ -1364,6 +1659,7 @@ def run_bot():
         _log_err("user_data_stream_start", e, cooldown=0)
 
     threading.Thread(target=t_ws_watchdog, daemon=True).start()
+    threading.Thread(target=t_position_reconciler, daemon=True).start()
     threading.Thread(target=t_monitor, daemon=True).start()
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
     threading.Thread(target=t_rescan, args=(syms,), daemon=True).start()
@@ -1374,7 +1670,8 @@ def run_bot():
     cycle = 0
     while True:
         cycle += 1
-        slots = MAX_POSITIONS - len(live_positions)
+        actual_open = len([k for k, v in live_positions.items() if not v.get("_r")])
+        slots = max(0, MAX_POSITIONS - actual_open)
         print(f"\n{'═'*68}")
         api_flag = f" | ⚠️API_FAIL:{_api_fail_streak}" if _api_fail_streak >= 20 else ""
         ws_idle = time.time() - _ws_last_msg_ts
@@ -1383,12 +1680,12 @@ def run_bot():
         btc_status = btc_macro.get_status_str()
         veto_summary = f"Veto[Wall:{_stats['wall_veto']}|BTC:{_stats['btc_breaker_veto']}|Spoof:{_stats['spoof_veto']}]"
 
-        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC_5M:{_macro['btc']} ({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U) | {veto_summary}{api_flag}{ws_flag}")
+        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC_5M:{_macro['btc']} ({actual_open}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U) | {veto_summary}{api_flag}{ws_flag}")
         print(f"        ↳ {btc_status}")
 
         if (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}")
-        elif slots == 0: print(f"  ✅ Slots full — monitoring posisi terbuka (TP/SL Only)")
-        else: print(f"  🔍 {slots} slot kosong — scanning order book & flow...")
+        elif slots == 0: print(f"  ✅ Slots full ({actual_open}/{MAX_POSITIONS}) — monitoring posisi terbuka (TP/BEP/SL/Trail)")
+        else: print(f"  🔍 {slots} slot kosong ({actual_open}/{MAX_POSITIONS}) — scanning order book & flow...")
         if cycle % 30 == 0: print_full()
         time.sleep(SCAN_INTERVAL)
 
