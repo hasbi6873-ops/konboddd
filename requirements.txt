@@ -3,6 +3,7 @@ gunicorn
 python-dotenv
 python-binance==1.0.37
 websockets>=14.1,<15
+websocket-client
 ta
 pandas
 requests
