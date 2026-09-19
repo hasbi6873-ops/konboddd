@@ -49,8 +49,9 @@ if not api_key or not api_secret:
     raise RuntimeError("API_KEY/API_SECRET belum diset di environment.")
 
 try:
-    # IMPORTANT: jangan override FUTURES_URL ke fapi.binance.com setelah ini.
-    # demo=True otomatis memilih demo-fapi.binance.com untuk REST Futures.
+    # demo=True membuat request Futures memilih FUTURES_DEMO_URL.
+    # Jangan gunakan client.FUTURES_URL sebagai indikator environment,
+    # karena atribut tersebut dapat tetap berisi URL production.
     client = Client(api_key, api_secret, demo=BINANCE_DEMO)
 except Exception:
     client = Client(api_key, api_secret, demo=BINANCE_DEMO)
@@ -2079,14 +2080,26 @@ def run_bot():
     print("║  5. SL = BAN 3 JAM + CLOSE POSISI LAIN YANG SEDANG LOSS          ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     # REST safety check: hanya Demo Futures yang boleh dipakai bot ini.
+    # CATATAN: pada python-binance, client.FUTURES_URL dapat tetap bernilai
+    # fapi.binance.com walaupun demo=True. URL yang benar-benar dipakai
+    # request Futures dipilih oleh _create_futures_api_uri(), yang akan
+    # menggunakan FUTURES_DEMO_URL saat client.demo=True.
     if not BINANCE_DEMO or not getattr(client, "demo", False):
-        raise RuntimeError("BINANCE_DEMO tidak aktif. Bot v23 ini dikunci untuk Binance Demo Trading.")
-    futures_url = str(getattr(client, "FUTURES_URL", ""))
-    if "demo-fapi.binance.com" not in futures_url:
-        raise RuntimeError(f"Endpoint Futures bukan Demo: {futures_url}")
+        raise RuntimeError(
+            "BINANCE_DEMO tidak aktif. Bot v23 ini dikunci untuk Binance Demo Trading."
+        )
+
+    demo_rest_url = str(
+        client._create_futures_api_uri("ping", version=1)
+    ).rsplit("/v1/ping", 1)[0]
+
+    if "demo-fapi.binance.com/fapi" not in demo_rest_url:
+        raise RuntimeError(
+            f"Endpoint Futures bukan Demo: {demo_rest_url}"
+        )
 
     print("  🧪 BINANCE ENV: DEMO TRADING (REST + WEBSOCKET)")
-    print(f"  🌐 REST: {futures_url}")
+    print(f"  🌐 REST Futures: {demo_rest_url}")
 
     try:
         valid = {s["symbol"] for s in _rest_call("startup_exchange_info", client.futures_exchange_info, retries=0)["symbols"] if s["status"] == "TRADING"}
@@ -2123,17 +2136,31 @@ def run_bot():
         raise RuntimeError("Binance WebSocket manager gagal diinisialisasi.")
 
     try:
+        # python-binance saat ini masih memiliki nilai default
+        # FSTREAM_DEMO_URL yang bukan endpoint Demo Futures yang kita perlukan.
+        # Kunci URL ini secara eksplisit sebelum socket apa pun dibuat.
         twm._bsm.FSTREAM_DEMO_URL = "wss://demo-fstream.binance.com/"
-        twm._bsm.FSTREAM_URL = "wss://demo-fstream.binance.com/" if BINANCE_DEMO else twm._bsm.FSTREAM_URL
+        twm._bsm.FSTREAM_URL = "wss://demo-fstream.binance.com/"
     except Exception as e:
-        raise RuntimeError(f"Gagal mengunci endpoint WebSocket Demo: {e}") from e
+        raise RuntimeError(
+            f"Gagal mengunci endpoint WebSocket Demo: {e}"
+        ) from e
 
-    # Safety check: bot ini tidak boleh diam-diam tersambung ke production.
+    # Safety check: mode client harus Demo dan URL Demo harus terkunci.
     if not getattr(twm._bsm, "demo", False):
-        raise RuntimeError("WebSocket manager bukan mode DEMO. Startup dibatalkan untuk mencegah production trading.")
+        raise RuntimeError(
+            "WebSocket manager bukan mode DEMO. Startup dibatalkan "
+            "untuk mencegah production trading."
+        )
+
+    if str(getattr(twm._bsm, "FSTREAM_DEMO_URL", "")) != "wss://demo-fstream.binance.com/":
+        raise RuntimeError(
+            "WebSocket Futures Demo belum terkunci ke "
+            "wss://demo-fstream.binance.com/"
+        )
 
     print("  🧪 BINANCE ENV: DEMO TRADING")
-    print(f"  🌐 REST Futures: {getattr(client, 'FUTURES_URL', 'UNKNOWN')}")
+    print(f"  🌐 REST Futures: {demo_rest_url}")
     print("  🌐 WS Futures:   wss://demo-fstream.binance.com/")
 
     twm.start_all_mark_price_socket(callback=handle_mark_price, fast=True)
