@@ -688,11 +688,13 @@ class LearningLayer:
 #  4B. USDT DOMINANCE MACRO ENGINE + 5M MARKET STRUCTURE
 # ═══════════════════════════════════════════════════════════════════════════
 
+TVDATAFEED_IMPORT_ERROR = None
 try:
     from tvDatafeed import TvDatafeed, Interval
-except Exception:
+except Exception as _tv_exc:
     TvDatafeed = None
     Interval = None
+    TVDATAFEED_IMPORT_ERROR = repr(_tv_exc)
 
 
 class USDTDominanceEngine:
@@ -723,7 +725,7 @@ class USDTDominanceEngine:
     def _ensure_tv(self):
         if TvDatafeed is None or Interval is None:
             raise RuntimeError(
-                "tvDatafeed belum terpasang. Jalankan: pip install tvdatafeed-enhanced"
+                "Import tvDatafeed gagal. " + f"ImportError={TVDATAFEED_IMPORT_ERROR}. " + "Package: tvdatafeed-enhanced==2.2.1"
             )
         if self.tv is None:
             if USDTD_TV_USERNAME and USDTD_TV_PASSWORD:
@@ -2111,6 +2113,14 @@ def run_bot():
     bootstrap_all_klines(syms)
 
     if USDTD_ENABLED:
+        print("  🔎 Cek dependency TradingView...")
+        if TvDatafeed is None:
+            raise RuntimeError(
+                "tvDatafeed import gagal. "
+                f"ImportError={TVDATAFEED_IMPORT_ERROR}. "
+                "Package: tvdatafeed-enhanced==2.2.1"
+            )
+        print("  ✅ tvDatafeed import OK")
         print("  📊 Memuat USDT.D 1H/2H/3H/4H dari TradingView...")
         ud0 = usdt_d.refresh(force=True)
         if ud0.get("regime") == "UNKNOWN":
