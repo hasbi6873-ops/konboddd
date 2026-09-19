@@ -40,16 +40,32 @@ load_dotenv()
 api_key = os.getenv("API_KEY")
 api_secret = os.getenv("API_SECRET")
 
-try:
-    client = Client(api_key, api_secret)
-except Exception:
-    client = Client(api_key, api_secret)
-client.FUTURES_URL = "https://fapi.binance.com/fapi"
+# ── BINANCE DEMO TRADING — WAJIB DEMO, BUKAN PRODUCTION ────────────────────
+# Binance Demo Futures memakai endpoint terpisah dari production.
+# python-binance modern mendukung Client(..., demo=True).
+BINANCE_DEMO = True
+
+if not api_key or not api_secret:
+    raise RuntimeError("API_KEY/API_SECRET belum diset di environment.")
 
 try:
+    # IMPORTANT: jangan override FUTURES_URL ke fapi.binance.com setelah ini.
+    # demo=True otomatis memilih demo-fapi.binance.com untuk REST Futures.
+    client = Client(api_key, api_secret, demo=BINANCE_DEMO)
+except Exception:
+    client = Client(api_key, api_secret, demo=BINANCE_DEMO)
+
+# ThreadedWebsocketManager versi python-binance yang dipakai bot belum
+# mengekspos argumen demo= pada constructor. Kita set parameter internal
+# sebelum thread dibuat agar AsyncClient di dalam TWM juga memakai demo=True.
+try:
     twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret)
+    if hasattr(twm, "_client_params"):
+        twm._client_params["demo"] = BINANCE_DEMO
 except Exception:
     twm = ThreadedWebsocketManager(api_key=api_key, api_secret=api_secret)
+    if hasattr(twm, "_client_params"):
+        twm._client_params["demo"] = BINANCE_DEMO
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION & INSTITUTIONAL PARAMETERS
@@ -1563,7 +1579,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
 
     d = "🟢" if execution_side == "LONG" else "🔴"
     imb_str = f" | BAI:{order_book.get_imbalance(sym)*100:+.0f}%" if order_book.get_book(sym) else ""
-    print(f"\n  {d} [LIVE PAPER-BASELINE INVERTED v22] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% | SL:{sl_pct*100:.2f}%{imb_str} | Regime:{regime}")
+    print(f"\n  {d} [DEMO USDT.D-BOS v23] {sym} EXEC:{execution_side} (Signal:{orig_direction}) @{price:.6g} | TP:{tp_pct*100:.2f}% | SL:{sl_pct*100:.2f}%{imb_str} | Regime:{regime}")
     print(f"         Signals: {' | '.join(sigs[:6])}")
     _stats["trades"] += 1
     if any("Absorb" in s for s in sigs):
@@ -2055,13 +2071,23 @@ def t_ws_watchdog():
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  💎 BOT SCALPING v23 LIVE — USDT.D + 5M BOS ENGINE                ║")
+    print("║  💎 BOT SCALPING v23 DEMO — USDT.D + 5M BOS ENGINE               ║")
     print("║  1. USDT.D 1/2/3/4H BULLISH -> Crypto SHORT on 5M bearish BOS   ║")
     print("║  2. USDT.D 1/2/3/4H BEARISH -> Crypto LONG on 5M bullish BOS   ║")
     print("║  3. TP = 2.5–3.5% (3.5x ATR capped) | SL = 1.5–2.5% (1.8x ATR) ║")
     print("║  4. Confluence: EMA20/50 + RSI + MACD + ADX + Volume + VWAP     ║")
     print("║  5. SL = BAN 3 JAM + CLOSE POSISI LAIN YANG SEDANG LOSS          ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
+    # REST safety check: hanya Demo Futures yang boleh dipakai bot ini.
+    if not BINANCE_DEMO or not getattr(client, "demo", False):
+        raise RuntimeError("BINANCE_DEMO tidak aktif. Bot v23 ini dikunci untuk Binance Demo Trading.")
+    futures_url = str(getattr(client, "FUTURES_URL", ""))
+    if "demo-fapi.binance.com" not in futures_url:
+        raise RuntimeError(f"Endpoint Futures bukan Demo: {futures_url}")
+
+    print("  🧪 BINANCE ENV: DEMO TRADING (REST + WEBSOCKET)")
+    print(f"  🌐 REST: {futures_url}")
+
     try:
         valid = {s["symbol"] for s in _rest_call("startup_exchange_info", client.futures_exchange_info, retries=0)["symbols"] if s["status"] == "TRADING"}
     except Exception as e:
@@ -2085,6 +2111,31 @@ def run_bot():
         )
 
     twm.start()
+
+    # Tunggu sampai AsyncClient/BinanceSocketManager internal siap.
+    # Lalu paksa endpoint USD-M Demo yang benar. Beberapa versi
+    # python-binance lama mendefinisikan FSTREAM_DEMO_URL sebagai endpoint
+    # testnet, sehingga kita override eksplisit ke Demo Trading.
+    ws_ready_deadline = time.time() + 10
+    while getattr(twm, "_bsm", None) is None and time.time() < ws_ready_deadline:
+        time.sleep(0.1)
+    if getattr(twm, "_bsm", None) is None:
+        raise RuntimeError("Binance WebSocket manager gagal diinisialisasi.")
+
+    try:
+        twm._bsm.FSTREAM_DEMO_URL = "wss://demo-fstream.binance.com/"
+        twm._bsm.FSTREAM_URL = "wss://demo-fstream.binance.com/" if BINANCE_DEMO else twm._bsm.FSTREAM_URL
+    except Exception as e:
+        raise RuntimeError(f"Gagal mengunci endpoint WebSocket Demo: {e}") from e
+
+    # Safety check: bot ini tidak boleh diam-diam tersambung ke production.
+    if not getattr(twm._bsm, "demo", False):
+        raise RuntimeError("WebSocket manager bukan mode DEMO. Startup dibatalkan untuk mencegah production trading.")
+
+    print("  🧪 BINANCE ENV: DEMO TRADING")
+    print(f"  🌐 REST Futures: {getattr(client, 'FUTURES_URL', 'UNKNOWN')}")
+    print("  🌐 WS Futures:   wss://demo-fstream.binance.com/")
+
     twm.start_all_mark_price_socket(callback=handle_mark_price, fast=True)
     twm.start_futures_multiplex_socket(callback=handle_all_ticker, streams=["!ticker@arr"])
     
