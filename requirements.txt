@@ -7,3 +7,4 @@ ta
 pandas
 requests
 numpy
+tvdatafeed-enhanced
