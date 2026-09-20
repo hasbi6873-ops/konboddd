@@ -1331,22 +1331,58 @@ def price_live(symbol):
 def tickers_all():
     global _ticker_cache, _ticker_ts
     now = time.time()
+
+    # WS ticker adalah sumber utama. Jika sehat, jangan menyentuh REST.
     if _ws_ticker_cache and (now - _ws_ticker_ts) < 15:
+        # Pastikan BTC macro juga punya harga walaupun aggTrade WS belum masuk.
+        btc = _ws_ticker_cache.get("BTCUSDT")
+        if btc:
+            try:
+                px = float(btc.get("last", 0) or 0)
+                if px > 0 and btc_macro.last_price <= 0:
+                    btc_macro.update_tick(px, now)
+            except Exception:
+                pass
         return _ws_ticker_cache
+
     # REST fallback dibatasi; strategi tetap sama saat WS sehat.
     if _ticker_cache and (now - _ticker_ts) < 15:
         return _ticker_cache
+
     try:
         raw = _rest_call("futures_ticker", client.futures_ticker, retries=1)
-        _ticker_cache = {
-            t["symbol"]: {
-                "pct": float(t["priceChangePercent"]),
-                "vol": float(t["quoteVolume"]),
-                "last": float(t["lastPrice"])
-            } for t in raw
-        }
-        _ticker_ts = now
-        _log_warn("tickers_all_ws_miss", "fallback REST — ticker WS kosong/basi", cooldown=30)
+        cache = {}
+        for t in raw:
+            try:
+                sym = t.get("symbol")
+                if not sym:
+                    continue
+                cache[sym] = {
+                    "pct": float(t.get("priceChangePercent", 0) or 0),
+                    "vol": float(t.get("quoteVolume", 0) or 0),
+                    "last": float(t.get("lastPrice", 0) or 0),
+                }
+            except (TypeError, ValueError):
+                continue
+
+        if cache:
+            _ticker_cache = cache
+            _ticker_ts = now
+
+            # FIX: BTCMacroEngine sebelumnya hanya mendapat harga dari aggTrade WS.
+            # Jika aggTrade WS terlambat/kosong, dashboard bisa menampilkan BTC $0.0
+            # dan breaker tidak mempunyai baseline. Seed dari ticker REST/WS.
+            btc = cache.get("BTCUSDT")
+            if btc:
+                px = float(btc.get("last", 0) or 0)
+                if px > 0 and btc_macro.last_price <= 0:
+                    btc_macro.update_tick(px, now)
+
+            _log_warn(
+                "tickers_all_ws_miss",
+                "fallback REST — ticker WS kosong/basi; BTC price disinkronkan",
+                cooldown=30,
+            )
     except Exception as e:
         _log_err("tickers_all", e)
         _api_fail("tickers_all")
@@ -2032,6 +2068,19 @@ def handle_all_ticker(msg):
         if cache:
             _ws_ticker_cache = cache
             _ws_ticker_ts = time.time()
+
+            # FIX: !ticker@arr bisa hidup sementara BTC aggTrade belum masuk.
+            # Sinkronkan BTC macro dari last price agar dashboard tidak pernah
+            # memulai dari BTC $0.0. AggTrade tetap menjadi sumber tick utama
+            # setelah stream tersebut aktif.
+            btc = cache.get("BTCUSDT")
+            if btc:
+                try:
+                    px = float(btc.get("last", 0) or 0)
+                    if px > 0 and btc_macro.last_price <= 0:
+                        btc_macro.update_tick(px, time.time())
+                except Exception:
+                    pass
     except Exception as e:
         _log_err("handle_all_ticker", e)
 
@@ -2278,9 +2327,25 @@ def run_bot():
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
     threading.Thread(target=t_rescan, args=(syms,), daemon=True).start()
     threading.Thread(target=t_macro, daemon=True).start()
+    # Seed harga BTC sebelum dashboard pertama. Ini mencegah BTC $0.0
+    # bila stream aggTrade Demo belum mengirim tick saat startup.
     time.sleep(2)
     tickers_all()
-    
+    if btc_macro.last_price <= 0:
+        try:
+            btc_seed = _rest_call(
+                "btc_seed_price",
+                client.futures_symbol_ticker,
+                symbol="BTCUSDT",
+                retries=1,
+            )
+            btc_px = float(btc_seed.get("price", 0) or 0)
+            if btc_px > 0:
+                btc_macro.update_tick(btc_px, time.time())
+                print(f"  ✅ BTC price seed: ${btc_px:,.1f}")
+        except Exception as e:
+            _log_err("btc_seed_price", e)
+
     cycle = 0
     while True:
         cycle += 1
