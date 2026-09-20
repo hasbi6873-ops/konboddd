@@ -1078,6 +1078,11 @@ _rest_price_cache = {}
 _rest_ticker_stale_until = 0.0
 _leverage_done = set()
 _order_state_uncertain = False
+_order_state_uncertain_since = 0.0
+_order_state_uncertain_sym = ""
+_order_state_uncertain_cid = ""
+_order_state_uncertain_reduce_only = False
+ORDER_STATE_VERIFY_INTERVAL = 10.0
 _sl_ban_lock = threading.Lock()
 _sl_ban_until = 0.0
 _sl_ban_reason = ""
@@ -1161,9 +1166,75 @@ def _rest_call(tag, fn, *args, retries=1, **kwargs):
 def _new_client_order_id(prefix, sym):
     return f"IV22_{prefix}_{sym}_{int(time.time()*1000)%1000000000}"[:32]
 
+def _clear_order_state_uncertain(reason="verified"):
+    global _order_state_uncertain, _order_state_uncertain_since
+    global _order_state_uncertain_sym, _order_state_uncertain_cid
+    global _order_state_uncertain_reduce_only
+    if _order_state_uncertain:
+        print(f"  ✅ ORDER STATE RECOVERED — {reason}")
+    _order_state_uncertain = False
+    _order_state_uncertain_since = 0.0
+    _order_state_uncertain_sym = ""
+    _order_state_uncertain_cid = ""
+    _order_state_uncertain_reduce_only = False
+
+def _recover_order_state_uncertain():
+    """Pulihkan hard-stop hanya setelah status order benar-benar bisa diverifikasi.
+    Tidak pernah mengulang POST MARKET order.
+    """
+    global _order_state_uncertain, _order_state_uncertain_since
+    global _order_state_uncertain_sym, _order_state_uncertain_cid
+
+    if not _order_state_uncertain:
+        return False
+
+    sym = _order_state_uncertain_sym
+    cid = _order_state_uncertain_cid
+    if not sym or not cid:
+        return False
+
+    try:
+        found = _rest_call(
+            f"recover_verify_order_{sym}",
+            client.futures_get_order,
+            symbol=sym,
+            origClientOrderId=cid,
+            retries=0,
+        )
+        if found:
+            status = str(found.get("status", "")).upper()
+            print(f"  ✅ ORDER VERIFIED — {sym} {cid} status={status}")
+            _clear_order_state_uncertain(f"order ditemukan ({status})")
+            return True
+    except Exception as e:
+        msg = str(e)
+        # Binance -2013 = Order does not exist. Untuk MARKET order yang
+        # hilang dari query, cek posisi. Jika posisi juga 0, aman dibuka lagi.
+        if "-2013" not in msg and "ORDER DOES NOT EXIST" not in msg.upper():
+            _log_warn("ORDER_RECOVERY", f"{sym}: verifikasi belum tersedia: {e}", cooldown=30)
+            return False
+
+        try:
+            pos_info = _rest_call(
+                f"recover_position_{sym}",
+                client.futures_position_information,
+                symbol=sym,
+                retries=0,
+            )
+            rows = pos_info if isinstance(pos_info, list) else [pos_info]
+            nonzero = any(abs(float(x.get("positionAmt", 0) or 0)) > 0 for x in rows if isinstance(x, dict))
+            if not nonzero:
+                _clear_order_state_uncertain(f"order tidak ada & posisi {sym} = 0")
+                return True
+        except Exception as pe:
+            _log_warn("ORDER_RECOVERY_POS", f"{sym}: cek posisi gagal: {pe}", cooldown=30)
+
+    return False
+
 def _create_market_order_safe(sym, side, quantity, reduce_only=False):
-    """Tidak me-retry POST order; gunakan clientOrderId untuk verifikasi bila perlu."""
-    global _order_state_uncertain
+    """Tidak me-retry POST order; verifikasi clientOrderId sebelum memberi status UNKNOWN."""
+    global _order_state_uncertain, _order_state_uncertain_since
+    global _order_state_uncertain_sym, _order_state_uncertain_cid, _order_state_uncertain_reduce_only
     cid = _new_client_order_id("C" if reduce_only else "O", sym)
     kwargs = {
         "symbol": sym,
@@ -1184,22 +1255,30 @@ def _create_market_order_safe(sym, side, quantity, reduce_only=False):
         if "403" in text or "429" in text or "418" in text or "CLOUDFRONT" in text:
             raise
 
-        # For ambiguous network/5xx errors, query by clientOrderId exactly once.
-        try:
-            time.sleep(0.5)
-            found = _rest_call(
-                f"verify_order_{sym}",
-                client.futures_get_order,
-                symbol=sym,
-                origClientOrderId=cid,
-                retries=0,
-            )
-            if found:
-                return found
-        except Exception:
-            pass
+        # Ambiguous network/5xx: JANGAN retry POST. Verifikasi clientOrderId
+        # beberapa kali agar transient timeout tidak langsung mematikan entry.
+        for delay in (0.5, 1.0, 2.0, 3.0):
+            try:
+                time.sleep(delay)
+                found = _rest_call(
+                    f"verify_order_{sym}",
+                    client.futures_get_order,
+                    symbol=sym,
+                    origClientOrderId=cid,
+                    retries=0,
+                )
+                if found:
+                    return found
+            except Exception as verify_exc:
+                msg = str(verify_exc).upper()
+                if "-2013" not in msg and "ORDER DOES NOT EXIST" not in msg:
+                    continue
 
         _order_state_uncertain = True
+        _order_state_uncertain_since = time.time()
+        _order_state_uncertain_sym = sym
+        _order_state_uncertain_cid = cid
+        _order_state_uncertain_reduce_only = reduce_only
         raise RuntimeError(f"ORDER STATUS UNKNOWN {sym} clientOrderId={cid}: {first_exc}") from first_exc
 
 def _get_order_fill(order):
@@ -1451,7 +1530,8 @@ def ks_check():
     if sl_remaining > 0:
         return True, f"SL_BAN({sl_remaining/3600:.2f}h)"
     if _order_state_uncertain:
-        return True, "ORDER_STATE_UNKNOWN — entry baru dihentikan"
+        age = time.time() - _order_state_uncertain_since if _order_state_uncertain_since else 0.0
+        return True, f"ORDER_STATE_UNKNOWN — verifikasi ({age:.0f}s)"
     if k["active"] and now >= k["resume"]: k["active"], k["consec"] = False, 0
     if k["active"]: return True, k["reason"]
     day = now - (now % 86400)
@@ -1850,6 +1930,10 @@ def t_monitor():
         try:
             if live_positions: monitor_positions()
         except: pass
+        try:
+            _recover_order_state_uncertain()
+        except Exception as e:
+            _log_warn("ORDER_RECOVERY_LOOP", e, cooldown=30)
         time.sleep(MONITOR_INT)
 
 def t_slot_filler(syms):
