@@ -74,11 +74,22 @@ except Exception:
 
 LEVERAGE      = 20
 ORDER_USDT    = 2.0
-MAX_POSITIONS = 3
+MAX_POSITIONS = 2
 
 # ── SL CIRCUIT BAN / LOSS LIQUIDATION ───────────────────────────────────────
 SL_BAN_SECONDS = 3 * 60 * 60      # 3 jam tidak membuka posisi baru setelah SL
-SL_LIQUIDATE_LOSERS = True        # Saat SL: tutup posisi lain yang sedang floating loss
+SL_LIQUIDATE_LOSERS = True        # Saat SL: evaluasi posisi lain, jangan tutup semua loss kecil
+CASCADE_MIN_LOSS_USDT = 0.30      # Cascade hanya untuk floating loss >= 0.30U
+CASCADE_MIN_HOLD_SEC = 45         # Hindari cascade posisi yang baru terbuka
+
+# ── PROFIT PROTECTION ────────────────────────────────────────────────────────
+# Lock profit berdasarkan pergerakan harga dari entry, agar universal untuk semua simbol.
+PROFIT_LOCK_1_TRIGGER = 0.008     # +0.80% -> lock +0.25%
+PROFIT_LOCK_1_LOCK    = 0.0025
+PROFIT_LOCK_2_TRIGGER = 0.015     # +1.50% -> lock +0.75%
+PROFIT_LOCK_2_LOCK    = 0.0075
+PROFIT_LOCK_3_TRIGGER = 0.020     # +2.00% -> lock +1.20%
+PROFIT_LOCK_3_LOCK    = 0.0120
 
 # Scanning & Concurrency
 # STRATEGY BASELINE = PAPER VERSION YANG TERBUKTI +2.95U
@@ -1542,15 +1553,19 @@ def _activate_sl_ban_and_liquidate(trigger_sym):
             except Exception:
                 px = 0.0
         if px <= 0:
-            print(f"  ⚠️ [SL LIQUIDATION] {sym}: harga floating tidak tersedia — posisi TIDAK dipaksa close")
+            print(f"  ⚠️ [SL CASCADE] {sym}: harga floating tidak tersedia — posisi TIDAK dipaksa close")
             continue
 
         fpnl = _estimate_floating_pnl(pos, px)
-        if fpnl < 0:
+        hold = time.time() - pos.get("open_time", time.time())
+        side = pos.get("side", "?")
+        if fpnl <= -CASCADE_MIN_LOSS_USDT and hold >= CASCADE_MIN_HOLD_SEC:
             candidates.append((sym, px, fpnl))
+            print(f"  🔻 [SL CASCADE] {sym} {side} ditandai | floating:{fpnl:+.5f}U hold:{hold:.0f}s")
+        elif fpnl > 0:
+            print(f"  ✅ [SL CASCADE] {sym} {side} dipertahankan | floating:{fpnl:+.5f}U (profit)")
         else:
-            side = pos.get("side", "?")
-            print(f"  ✅ [SL LIQUIDATION] {sym} {side} dipertahankan | floating:{fpnl:+.5f}U (profit/non-loss)")
+            print(f"  🛡️ [SL CASCADE] {sym} {side} dipertahankan | floating:{fpnl:+.5f}U (loss kecil < {CASCADE_MIN_LOSS_USDT:.2f}U)")
 
     for sym, px, fpnl in candidates:
         print(f"  🔻 [SL LIQUIDATION] {sym} ditutup | floating:{fpnl:+.5f}U")
@@ -1649,6 +1664,9 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         "atr": atr, "regime": regime, "bias": bias,
         "tp_pct": tp_pct, "sl_pct": sl_pct,
         "tp_price": tp_price, "sl_price": sl_price,
+        "original_sl_price": sl_price,
+        "protected_sl_price": None,
+        "profit_lock_stage": 0,
         "peak_price": price
     }
     with _lock: live_positions[sym] = pos
@@ -1687,6 +1705,9 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
                     "sl_pct": new_risk["sl_pct"],
                     "tp_price": new_risk["tp_price"],
                     "sl_price": new_risk["sl_price"],
+                    "original_sl_price": new_risk["sl_price"],
+                    "protected_sl_price": None,
+                    "profit_lock_stage": 0,
                     "peak_price": price
                 })
 
@@ -1777,8 +1798,8 @@ def live_close(sym, reason, price=None):
         _stats["losses"] += 1
         if pnl < _stats["worst"]: _stats["worst"] = pnl
 
-    # TRAILING STOP REMOVED: Hapus pencatatan exit karena trailing
-    if "SL" in reason: _stats["hard_sl"] += 1
+    # Profit-lock adalah protective exit, BUKAN hard SL dan TIDAK memicu ban 3 jam.
+    if reason == "SL": _stats["hard_sl"] += 1
     elif "TP" in reason: _stats["tp_exit"] += 1
 
     trade_log.append({
@@ -1786,8 +1807,8 @@ def live_close(sym, reason, price=None):
         "pnl": round(pnl, 5), "reason": reason, "hold": int(hold),
     })
 
-    # HANYA SL ASLI memicu ban 3 jam + likuidasi posisi lain yang sedang minus.
-    # TIME_LIMIT, TP, dan CASCADE_AFTER_SL tidak memicu ban baru.
+    # HANYA SL ASLI memicu ban 3 jam. Profit-lock, TIME_LIMIT, TP, dan cascade
+    # tidak memicu ban baru. Cascade hanya menutup loss yang sudah cukup besar.
     if reason == "SL":
         _activate_sl_ban_and_liquidate(sym)
 
@@ -1823,13 +1844,56 @@ def monitor_positions():
         else:
             if px < pos["peak_price"]: pos["peak_price"] = px
 
-        # RESTORED TP/SL & NO TRAILING: Monitoring HANYA menggunakan TP Baru, SL Baru, dan Time Limit
+        # ── PROFIT LOCK / BEP PROTECTION ───────────────────────────────────
+        # Setelah profit cukup besar, SL asli dinaikkan ke level profit tertentu.
+        # Jika tersentuh, exit diberi reason PROFIT_LOCK sehingga TIDAK memicu SL ban.
+        favorable_pct = ((px - pos["entry"]) / pos["entry"] if side == "LONG"
+                         else (pos["entry"] - px) / pos["entry"])
+        lock_stage = int(pos.get("profit_lock_stage", 0))
+        new_stage = lock_stage
+        lock_pct = None
+        if favorable_pct >= PROFIT_LOCK_3_TRIGGER:
+            new_stage, lock_pct = 3, PROFIT_LOCK_3_LOCK
+        elif favorable_pct >= PROFIT_LOCK_2_TRIGGER:
+            new_stage, lock_pct = 2, PROFIT_LOCK_2_LOCK
+        elif favorable_pct >= PROFIT_LOCK_1_TRIGGER:
+            new_stage, lock_pct = 1, PROFIT_LOCK_1_LOCK
+
+        if new_stage > lock_stage:
+            protected = (pos["entry"] * (1 + lock_pct) if side == "LONG"
+                         else pos["entry"] * (1 - lock_pct))
+            original_sl = pos.get("original_sl_price", pos.get("sl_price", sl_px))
+            # Hanya naikkan proteksi; jangan pernah melonggarkan SL.
+            if side == "LONG":
+                protected = min(protected, tp_px * 0.999)
+                if protected > original_sl:
+                    pos["protected_sl_price"] = protected
+                    pos["sl_price"] = protected
+                    pos["profit_lock_stage"] = new_stage
+                    sl_px = protected
+                    print(f"  🛡️ {sym}: PROFIT LOCK stage {new_stage} | peak:{favorable_pct*100:.2f}% | protected SL:{protected:.8g}")
+            else:
+                protected = max(protected, tp_px * 1.001)
+                if protected < original_sl:
+                    pos["protected_sl_price"] = protected
+                    pos["sl_price"] = protected
+                    pos["profit_lock_stage"] = new_stage
+                    sl_px = protected
+                    print(f"  🛡️ {sym}: PROFIT LOCK stage {new_stage} | peak:{favorable_pct*100:.2f}% | protected SL:{protected:.8g}")
+
+        # TP / protected SL / hard SL / TIME LIMIT.
         if side == "LONG":
             if px >= tp_px: live_close(sym, "TP", tp_px); continue
-            if px <= sl_px: live_close(sym, "SL", sl_px); continue
+            protected_sl = pos.get("protected_sl_price")
+            if protected_sl is not None and px <= protected_sl:
+                live_close(sym, "PROFIT_LOCK", protected_sl); continue
+            if px <= pos.get("original_sl_price", sl_px): live_close(sym, "SL", pos.get("original_sl_price", sl_px)); continue
         elif side == "SHORT":
             if px <= tp_px: live_close(sym, "TP", tp_px); continue
-            if px >= sl_px: live_close(sym, "SL", sl_px); continue
+            protected_sl = pos.get("protected_sl_price")
+            if protected_sl is not None and px >= protected_sl:
+                live_close(sym, "PROFIT_LOCK", protected_sl); continue
+            if px >= pos.get("original_sl_price", sl_px): live_close(sym, "SL", pos.get("original_sl_price", sl_px)); continue
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  6. SCANNER THREAD & HARD VETO FILTERS
